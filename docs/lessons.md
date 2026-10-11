@@ -3,6 +3,10 @@
 设计写在 runtime.md / serve.md / multi-gpu.md 里；这里只记那些"不写下来下次还会
 再踩一遍"的事，以及它们落到了哪条规则上。
 
+## 2026-10-11，优化一个 kernel 之前，先看上游怎么写
+
+优化 kernel A 之前，先查 FlashInfer / TRT-LLM / vLLM 等是怎么实现类似 kernel 的。
+
 ## 2026-10-09，删掉"没有模型用"的代码之前，先看模型
 
 3005ed9 以"qwen3 和 K3 都没有每序列状态"为由，把流水线 item 里的 line table 和 slot 清零删了。
