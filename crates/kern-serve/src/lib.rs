@@ -15,6 +15,7 @@ mod pp;
 mod scheduler;
 mod tray;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -112,6 +113,7 @@ pub fn serve(o: ServeOpts, art: Artifacts) -> Result<()> {
         .with_context(|| format!("reading manifest {}", art.manifest.display()))?;
     let manifest =
         Verified::from_json(&manifest_json).with_context(|| format!("manifest {}", art.manifest.display()))?;
+    log_manifest(&manifest);
     anyhow::ensure!(
         manifest.cut.is_none() || (gpus.len() == 1 && (o.pp_listen.is_some() || o.pp_head.is_some())),
         "a pipeline stage runs on one GPU, with `--pp-listen` (stage 0) or `--pp-head` (the others)"
@@ -166,6 +168,53 @@ pub fn serve(o: ServeOpts, art: Artifacts) -> Result<()> {
         Ok((sched, facts))
     };
     launch(load, served_name, model_path, o.port)
+}
+
+/// Logs the verified manifest before any GPU work: buffer kinds, module count, and each program's calls.
+fn log_manifest(m: &Verified) {
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    for b in m.buffers.values() {
+        *kinds.entry(b.kind.to_string()).or_default() += 1;
+    }
+    let kinds = kinds.iter().map(|(k, n)| format!("{k}={n}")).collect::<Vec<_>>().join(" ");
+    let registry = m
+        .modules
+        .values()
+        .filter(|md| md.source.starts_with("hf:") || md.source.starts_with("https:"))
+        .count();
+    info!(
+        buffers = m.buffers.len(),
+        kinds = %kinds,
+        modules = m.modules.len(),
+        registry,
+        states = m.states.len(),
+        ops = m.ops.len(),
+        "manifest"
+    );
+    for (name, p) in &m.programs {
+        info!(program = %name, calls = p.calls.len(), shape = %program_shape(p), "program");
+    }
+}
+
+fn program_shape(p: &kern_manifest::types::Program) -> String {
+    let mut parts = Vec::new();
+    if let Some(b) = &p.batch {
+        let rows = match &b.rows {
+            kern_manifest::types::Dim::Const(n) => n.to_string(),
+            kern_manifest::types::Dim::Var(v) => v.clone(),
+        };
+        parts.push(format!("batch groups={} rows={rows}", b.groups));
+    }
+    if p.once {
+        parts.push("once".into());
+    }
+    if p.derive {
+        parts.push("derive".into());
+    }
+    if p.graph {
+        parts.push("graph".into());
+    }
+    parts.join(" ")
 }
 
 /// Run the scheduler `load` builds on a thread of its own, which owns it
