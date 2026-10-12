@@ -177,11 +177,8 @@ fn log_manifest(m: &Verified) {
         *kinds.entry(b.kind.to_string()).or_default() += 1;
     }
     let kinds = kinds.iter().map(|(k, n)| format!("{k}={n}")).collect::<Vec<_>>().join(" ");
-    let registry = m
-        .modules
-        .values()
-        .filter(|md| md.source.starts_with("hf:") || md.source.starts_with("https:"))
-        .count();
+    let registry =
+        m.modules.values().filter(|md| md.source.starts_with("hf:") || md.source.starts_with("https:")).count();
     info!(
         buffers = m.buffers.len(),
         kinds = %kinds,
