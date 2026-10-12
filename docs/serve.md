@@ -406,6 +406,11 @@ OOM——块大小该随预算长，先记着，e2e 里 K3 显式 `--capacity 26
 "没测"清单的第 1 条（t=1 qwen3.8-27b conc1 对 `kern run`、K1/K3 门禁）由这一节覆盖；2、3（t>1 的
 owner-only 页、park 的全成或全不成）仍没测。
 
+2026-10-12（tray03，4×GB300）去掉 span、prompt 只走 chunk program、K3 迁出之后重跑 qwen3-4b /
+qwen3-4b-dspark / qwen3.8-27b：10 + 11 + 9 门全过（`kern test` PASS，conc1 12/12 与 `kern run` 同，dspark 接受率
+并发 24% 对串行 24.9%，`--rows 1` 4/4，分歧都是有 logits 证据的近平局）；结果在
+`~/bench_results/2026-10-12-drop-span-e2e/`。
+
 ## toy 门禁（`tools/toy`，2026-09-15，tray03 / tray06 GB300）
 
 真模型的 e2e 一轮 20 分钟、要三台 tray，还有近平局要争。`tools/toy` 是一组不是模型的
