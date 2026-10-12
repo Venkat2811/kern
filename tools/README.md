@@ -18,35 +18,22 @@
 | 5 | `extract_kernels.sh` | manifest + dump 目录 → `kernels/`：`modules` 表里每个 module 按 sha256 在 dump（递归）/ `target/cubins` 里找到文件，落地为 `<module>-<sha12>.cubin`；只增不减，同一目录可放每个版本，A/B 两份 manifest 共用（runtime 只装载各自点名的） |
 | 6 | `qwen_weights.py` | 生成器的最后一道（`gen_qwen35.py` / `gen_qwen3_decode.py` 的 build 都以它收尾，也可单跑改写一份 manifest）：给每个 weight buffer 写 `bind`——qkv / gate_up 拼接、tied lm_head 指回 embed、draft 的 fc 按列切 5 块、fused KV 按层 cat——并生成 `load` once program 算 checkpoint 里没有的表：Gemma norm 的 +1、A_log 的 f32、rope cos / sin、kv_scales 全 1、chunk 索引（核在 `kernels-src/weight_prep.cu`）。没有导出这一步：`--weights` 直接给 HF snapshot 目录，runtime 只读 safetensors header |
 
-## K3（多卡线，E1/E2）
+## 其他
 
-kern 的 Kimi-K3 pruned decode 不是从 vLLM 挖的：vLLM 的 K3 路径是 fused
-KDA / trtllm-gen MLA / DeepGEMM MegaMoE 的 struct ABI 与 torch.compile 混合，
-不可 rebind。核来自 pegainfer 的认证 K3 核集，program 逐行照 pegainfer 的
-`k3_step` 发射，oracle 是 pegainfer 的 golden fixture（`crates/kern-run/
-examples/k3_golden.rs`）。
+Kimi-K3 的生成器、核源码、harness 与 manifest 在
+[pegainfer-project/kern-k3-pp-prefill](https://github.com/pegainfer-project/kern-k3-pp-prefill)
+（PP prefill，钉一个 kern commit）；本仓库删掉它们之前的最后一版见 git 历史。
+`crates/kern-manifest/tests/fixtures/k3/` 是从那里 `kern cut` 出来的几层，CI 用它
+守住 kern 对这条线的契约。
 
 | 工具 | 输入 → 输出 |
 |------|-------------|
-| `kernels-src/k3_*.cu` | K3 decode 核集（2026-09-02 CUDA C++ 重写，契约 ../docs/k3-kernel-abi.md；E2 时期 pegainfer 的 TileLang 桶核 + line shim 已删，见 git 历史）：`k3_residual`（attnres_rms / land_add_attnres_rms / land_add2）、`k3_conv_silu`、`k3_kda_core`、`k3_mla_prep`、`k3_mla_paged_attn`（cluster-8 split-KV，32k ctx 258 µs）、`k3_router_argmax`（router_topk / argmax / rms）、`k3_land`；elementwise（add、mul_sigmoid、norm、cuBLAS f32 partial 的 landing）都融进邻居核，每 rank B 是变量（≤ 64）。`k3_kv_append.cu`、`k3_mega_stage.cu`：latent 追加、MegaMoE 输入 staging |
-| `k3-harness/` | 核的验收 harness：driver-API 加载 cubin，随机输入 + CPU 参考（`ref.h`），B ∈ {1,2,8,64}，容差 3 bf16 ULP + 1e-3 / 相对 RMS ≤ 2e-3；`run_all.sh` 跑全套；`notes/`、`reports/`（ncu）每核一份；`baseline/` 存 pegainfer 原版 MLA 核作对照 |
-| `k3-mega/` + `build_k3_mega.sh` | DeepGEMM MegaMoE fork（SymBuffer 在设备上读 peer 表，R ∈ {1,4,8,16}）→ `k3_mega_moe.cubin` + `k3_mega_layout_dump`（E1） |
-| `once.py` + `kernels-src/weight_prep.cu`、`k3_weight_prep.cu` | 生成器共用的 `load` program 构造：checkpoint 没有的表（Qwen 的 norm+1 / rope 表，K3 的 conv taps、scoring 向量、wsm 拼块、MegaMoE scale 打包）是 `carry`，`load` 在装载后算一次；权重本身全部 `bind` HF checkpoint（TP 分片 = 按 rank 选行 / 列，MegaMoE gate/up = `interleave` 段），不再有导出中间态 |
-| `gen_k3.py` | `--layers N --ranks R --max-ctx C --seqs S [--tp R --chunk N]` → `examples/k3-<N>l-ep<R>.json` / `k3-ep<R>.json`：整条 decode program（93 层 1855 launch，742 个 cuBLAS GEMM），`tokens`/`seqs` 是变量，几何在 `GEOM` 表里；MoE 三步来自 `gen_k3_moe.mega_pieces`；`--tp R --chunk N` 的 tray prefill 走 `k3_moe_bmm.pieces`（trtllm-gen batched GEMM，K14），`--moe-variants FC1,FC2` 指名变体做扫描，默认取索引的 `[[pick]]`。核改了要先 `tools/kernels/import_handwritten.py <name>` 再生成（manifest 钉索引里的 sha）；权重 = HF pruned checkpoint 目录，`k3_golden --weights <dir>` |
-| `k3_oracle_dump.py` | 任一 OpenAI 兼容服务 → fixture（teacher-forced greedy）。vLLM 带 top-5 logprob，给 `k3_golden --margin-abs` 做 noise-floor 判定；pegainfer 的 K3 不出 logprob，用 `--no-logprobs`（`return_token_ids`，只记 argmax，逐步必须精确一致）。长 prompt 用 `--check-last N`：只对最后 N 个 prompt 位置和续写步请求参考，前面的位置记 `argmax=-1`（runner 只喂不比） |
-| `flash_kda_abi.py` | FlashKDA（MoonshotAI，`tools/flash-kda/`）作为 kern op 的数据：prepare / recurrence 两个 launch 的 `bytes<256>` TiledCopy pack、workspace buffer、参数表（从 kernel-capture 提出，见 k3-kernel-abi.md K8）；`gen_k3.py --span-max` / `--chunk` 用它 |
-| `gen_flash_kda_probe.py` | 只含 `flash_kda` 一个 op 的 manifest，`program_io` 例子喂 `tools/flash-kda/probe.cu` 的 dump 做逐位门禁（C2） |
-| `trtllm_fmha_abi.py` | TensorRT-LLM gen 的 ragged context FMHA（FlashInfer 的 cubin，索引族 `trtllm_fmha_ctx_h192_v128`）作为 kern op 的数据：`bytes<1344>` 的 `KernelParams` pack（四个 tensormap + 指针 + 标量，从 kernel-capture 提出，见 k3-kernel-abi.md K13）；`gen_k3.py --mla v2` 用它 |
-| `gen_trtllm_fmha_probe.py` | 只含 `mla_fmha` 一个 op 的 manifest，`program_io` 喂 `tools/trtllm-fmha/probe.py` 的 dump 做逐位门禁（K13） |
-| `k3_moe_bmm.py` | K3 的 routed MoE 作为 trtllm-gen batched GEMM（索引族 `trtllm_bmm_mxe4m3_mxe2m1_mxe4m3` / `trtllm_bmm_bf16_mxe2m1_mxe4m3`，ABI `kernels/abi/trtllm_bmm.py`）+ `kernels-src/k3_moe_prefill.cu` 的 glue：量化、路由表、FC1 / FC2、合并、权重洗牌（k3-kernel-abi.md K14）；`gen_k3.py` 与 probe 生成器共用 |
-| `gen_trtllm_bmm_probe.py` | 一个 rank 的 MoE manifest（`<T> <local> <rank>`），`program_io` 喂 `tools/trtllm-bmm/probe.py` 的 dump 做逐位门禁（K14） |
+| `once.py` + `kernels-src/weight_prep.cu` | 生成器共用的 `load` program 构造：checkpoint 没有的表（Qwen 的 norm+1 / rope 表）是 `carry`，`load` 在装载后算一次；权重本身全部 `bind` HF checkpoint（TP 分片 = 按 rank 选行 / 列，`interleave` 段），不再有导出中间态 |
+| `trtllm_fmha_abi.py` | TensorRT-LLM gen 的 ragged context FMHA（FlashInfer 的 cubin，索引族 `trtllm_fmha_ctx_h192_v128`）作为 kern op 的数据：`bytes<1344>` 的 `KernelParams` pack（四个 tensormap + 指针 + 标量，从 kernel-capture 提出，见 k3-kernel-abi.md K13） |
+| `gen_trtllm_fmha_probe.py` | 只含 `fmha` 一个 op 的 manifest，`program_io` 喂 `tools/trtllm-fmha/probe.py` 的 dump 做逐位门禁（K13） |
 | `kernels/pick.py` | 把 `kern bench` 选出的变体写进索引的 `[[pick]]`，report 进 blob store |
-| `flash_kda_ref.py` | numpy f64 的 K3 KDA 逐 token 参考，对 probe dump 报 out / state 的 relRMS（两种 state 朝向都报） |
-| `k3_tokenizer_json.py` | Kimi-K3 的 tiktoken checkpoint → HF `tokenizer.json`（kern-serve 的前端只认这个），special token 与样例文本对 checkpoint 自己的 tokenizer round-trip 后才写出 |
 | `vmm_bench.py` | CUDA VMM 块池的代价（roadmap K1b）：`cuMemMap` / `cuMemSetAccess` / `cuMemUnmap` 每块延迟，拼一页 KV / 一个 state slot / 一份 K3 state 的总耗时与首次访问，以及 map/unmap 进行时同卡带宽循环的抖动；只用 driver API（ctypes），不用编译，`python3 tools/vmm_bench.py <gpu>` |
 | `crates/kern-run/examples/agentx_replay.rs` | K1 的 host 门禁：把 AgentX（Claude Code）trace（HF `semianalysisai/cc-traces-weka-062126`）按时间回放进 `Pool` + `Prefix`（只有页号，不碰 GPU），报命中率 / extend 分位 / 淘汰数 / remap 数与 slot 峰值；`--unit` 页大小、`--kv-bytes` 每 token 字节、`--state <每 slot 字节>` 带循环状态（只在请求结束留 checkpoint）、`--budget-gib` 页与 slot 共用的预算（或 `--capacity` token 数 + `--slots` 起始 slot 数）、`--concurrency` |
-| `crates/kern-run/examples/k3_golden.rs` | 门禁 runner：`--manifest --weights --fixture --gpus --graph`；`--seqs B --mixed [--distinct]` 让每 rank 跑 B 行（行 0 是 fixture，其余随机 prompt），每行与"同 B 的自身拷贝批"逐 token 比（cuBLAS 按 m 选核，B=1 与 B=8 在近平局处可以不同）；跨 tray `--world 8 --rank-base 0|4 --rendezvous host:port` |
-
 
 支撑件：
 

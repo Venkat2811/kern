@@ -10,8 +10,7 @@
 // (`get_base_ptr`, `map`, `rank_idx`) keeps its meaning.
 //
 // This header shadows `deep_gemm/layout/sym_buffer.cuh` by include-path order
-// (see tools/build_k3_mega.sh); the impl and comm/barrier.cuh compile against
-// it unchanged.
+// (see build.sh); the impl and comm/barrier.cuh compile against it unchanged.
 #pragma once
 
 #include <cstdint>

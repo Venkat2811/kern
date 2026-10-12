@@ -9,7 +9,7 @@ if [[ -n "${DEEPGEMM_ROOT:-}" ]]; then
   nvcc -std=c++20 -O3 --expt-relaxed-constexpr -DDG_NO_TORCH -arch="${KERN_SM:-sm_103a}" -I "$DEEPGEMM_ROOT/deep_gemm/include" -I "$DEEPGEMM_ROOT/third-party/cutlass/include" -cubin "$src/mega_gate.cu" -o "$out/mega_gate.cubin"
   nvcc -std=c++20 -O3 --expt-relaxed-constexpr -DDG_NO_TORCH -arch="${KERN_SM:-sm_103a}" -I "$DEEPGEMM_ROOT/deep_gemm/include" -I "$DEEPGEMM_ROOT/third-party/cutlass/include" -cubin "$src/dense.cu" -o "$out/dense.cubin"
   mkdir -p "$out/include/deep_gemm/layout"
-  cp "$src/../../k3-mega/include/deep_gemm/layout/sym_buffer.cuh" "$out/include/deep_gemm/layout/"
+  cp "$src/include/deep_gemm/layout/sym_buffer.cuh" "$out/include/deep_gemm/layout/"
   python3 "$src/fork_moe.py" "$DEEPGEMM_ROOT" "$out/sm100_fp8_fp4_mega_moe.cuh"
   nvcc -std=c++20 -O3 --expt-relaxed-constexpr -DDG_NO_TORCH -arch="${KERN_SM:-sm_103a}" -I "$out/include" -I "$out" -I "$DEEPGEMM_ROOT/deep_gemm/include" -I "$DEEPGEMM_ROOT/third-party/cutlass/include" -cubin "$src/mega_moe.cu" -o "$out/mega_moe.cubin"
   nvcc -std=c++20 -O3 --expt-relaxed-constexpr -DDG_NO_TORCH -I "$DEEPGEMM_ROOT/deep_gemm/include" -I "$DEEPGEMM_ROOT/third-party/cutlass/include" "$src/moe_layout.cu" -o "$out/moe_layout"

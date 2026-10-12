@@ -1,6 +1,6 @@
 """The `load` program under construction: what the checkpoint does not hold
 is a `carry` buffer that a once-after-load program computes from the
-tensors it does (tools/kernels-src/weight_prep.cu, k3_weight_prep.cu). No
+tensors it does (tools/kernels-src/weight_prep.cu). No
 exported artifact, no torch: `kern run --weights <HF snapshot dir>`.
 
 A generator declares its weight buffers with `bind` segments straight
@@ -31,20 +31,8 @@ KERNELS = {
     "iota_i32": ("weight_prep", "kern_iota_i32", ["out buffer<i32>", "i32", "i32", "i32", "i32"]),
     "rope_table": ("weight_prep", "kern_rope_table_bf16",
                    ["out buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "f32"]),
-    "fill_bf16": ("k3_weight_prep", "kern_fill_bf16", ["out buffer<bf16>", "i32", "f32"]),
-    "k3_conv_taps": ("k3_weight_prep", "kern_k3_conv_taps",
-                     ["in buffer<f32>", "in buffer<f32>", "in buffer<f32>", "out buffer<f32>", "i32"]),
-    "k3_scoring": ("k3_weight_prep", "kern_k3_scoring", ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32"]),
-    "k3_wsm": ("k3_weight_prep", "kern_k3_wsm", ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"]),
-    "k3_mega_sf_pack": ("k3_weight_prep", "kern_k3_mega_sf_pack",
-                        ["in buffer<u8>", "out buffer<i32>", "i32", "i32", "i32", "i32"]),
-    "k3_kvb_aug": ("k3_weight_prep", "kern_k3_kvb_aug", ["in buffer<bf16>", "out buffer<bf16>", "i32"]),
-    "k3_moe_w_shuffle": ("k3_moe_prefill", "kern_k3_moe_w_shuffle",
-                         ["in buffer<u8>", "out buffer<u8>", "i32", "i32", "i32", "i32"]),
-    "k3_moe_sf_shuffle": ("k3_moe_prefill", "kern_k3_moe_sf_shuffle",
-                          ["in buffer<u8>", "out buffer<u8>", "i32", "i32", "i32", "i32"]),
 }
-FILL = {"f32": ("fill_f32", "f32"), "bf16": ("fill_bf16", "f32"), "i32": ("fill_i32", "i32"),
+FILL = {"f32": ("fill_f32", "f32"), "i32": ("fill_i32", "i32"),
         "i64": ("fill_i64", "i64"), "u8": ("fill_u8", "i32")}
 
 

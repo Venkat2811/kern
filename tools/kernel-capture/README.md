@@ -25,7 +25,7 @@ build.sh    builds libkernelcapture.so (needs CUPTI from a CUDA toolkit)
    the ones kern launches, keep everything else verbatim.
 2. **Write a reference launcher** — a small host program that calls the
    kernel through upstream's own launch code on deterministic inputs and
-   dumps inputs and outputs (`tools/flash-kda/probe.cu` is the model). This
+   dumps inputs and outputs (`tools/trtllm-fmha/probe.py` is the model). This
    is both the ABI source and the bit-exact oracle for the manifest op.
 3. **Capture** it:
 
@@ -60,20 +60,20 @@ build.sh    builds libkernelcapture.so (needs CUPTI from a CUDA toolkit)
    `ScaledBasis<int, k>`) are decoded from the demangled type (`cu++filt`);
    the rest of the struct is host stack garbage that upstream never
    initialises and the pack leaves at zero.
-5. **Declare** the op in the generator (`tools/gen_k3.py` and
-   friends) and record the ABI in `docs/k3-kernel-abi.md`. The runtime
-   compares the declared params against `cuFuncGetParamInfo` at load, so a
-   wrong width fails before a launch.
+5. **Declare** the op in the generator and record the ABI beside it
+   (`tools/trtllm_fmha_abi.py`; `docs/k3-kernel-abi.md` is the K3 record).
+   The runtime compares the declared params against `cuFuncGetParamInfo` at
+   load, so a wrong width fails before a launch.
 6. **Gate**: run the op through kern on the reference launcher's inputs and
    diff its outputs against the dump. Bit-exact is the expectation — same
    cubin, same bytes in, same bytes out; a difference is a wrong field.
    `crates/kern-run/examples/program_io.rs` runs any program of any manifest
    from raw input files and writes raw outputs, so the gate is a manifest
-   with just the op (e.g. `tools/gen_flash_kda_probe.py`) plus `cmp`:
+   with just the op (e.g. `tools/gen_trtllm_fmha_probe.py`) plus `cmp`:
 
-       program_io --manifest probe.json --cubins target/cubins --program span \
-           --env span=64 --in q=dump/q.bin --in k=dump/k.bin ... --out out=got/out.bin
-       cmp got/out.bin dump/out.bin
+       program_io --manifest probe.json --cubins target/cubins --program attn \
+           --vars tokens=512 --in q=dump/q.bin --in kv=dump/kv.bin ... --out o=got/o.bin
+       cmp got/o.bin dump/out.bin
 
 ## Notes
 
