@@ -203,17 +203,6 @@ fn a_prefill_only_manifest_takes_its_steps_as_one_row_chunks() {
 }
 
 #[test]
-fn a_span_program_is_not_driven_and_a_change_in_it_is_untapped() {
-    let a = Fixture::default().span();
-    let (r, lines) = test(&a, &a.clone().scale("scale_same"), &options()).unwrap();
-    // the workload stages no run, so the span program's change stays untapped: inconclusive, not a panic
-    assert_eq!(verdict(&r), (2, "a changed program was not tapped — the workload driver can't stage it".into()));
-    let local = r.summary.local.as_ref().unwrap();
-    assert_eq!((local.compared, local.bit_identical), (12, 12));
-    assert_eq!(local.undriven, ["decode_span"], "{lines:#?}");
-}
-
-#[test]
 fn identical_manifests_have_nothing_to_test() {
     let (ma, mb) = (Fixture::default().manifest(), Fixture::default().manifest());
     let d = kern_test::diff::diff(&ma, &mb);

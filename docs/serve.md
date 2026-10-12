@@ -328,31 +328,10 @@ page_table 是 256 × 8192 i32 = 8 MiB，每步每卡整块 DMA。改成只拷�
   每个 rank 的块是它自己的行数（至少 1 行 pad），组内块长之和垫到阶梯就是 tray 的行数
   （`rows` var；多组时各组垫到同一个数，垫在最小的块上；t=1 退化成每卡等块），块的前缀和写进
   `blocks` fill，collective 核按它换算行号（peer_collective.cu）；own 轴的 buffer 仍按最大块的
-  bucket b 铺、pad 页每卡一页。一条序列 256 行的 run 于是让 tray 是 256 + 3 行而不是 4 × 256——
-  之前 768 行 pad 走完整套核和每层 allreduce，是 TP4 span 步 142 对 t=1 87 ms 的全部差额。
-  256 之上的阶梯加了 264 / 272 / 288 / 304 / 320，一条 run 加几张卡的一两行只垫几行（曾试过把 run 缩到
-  阶梯值上一行不垫：6 个 token 的 prompt 被切成两步、1k 的 4 步变 5 步，省几行 pad 换整整一步，撤了）。`Staged` 借住 `&mut Tray` 直到输出读完，中间不能 lease / fork /
+  bucket b 铺、pad 页每卡一页。`Staged` 借住 `&mut Tray` 直到输出读完，中间不能 lease / fork /
   再 stage。manifest 有 `error` fill 的输出时每步读一次，非零即该步失败。
-- **K3 没有 prefill program，prompt 走 span**：`prefill` 可选；没有时 prompt 在 prefix
-  命中之外的部分走 decode 步，该行的输出在最后一个 prompt token 进去之前丢掉。manifest 有
-  带 `batch.span` 的 program（K5：`"batch": {"groups": …, "rows": 1, "span": "span"}` +
-  `span_at` fill 的 `[1]` i32 输入，`Protocol::spanned(b)` 选它）时一步里**每个 tp 组一个** cell 可以是
-  一段 run——同一序列的 c 个连续 token 各占一行（`Layout` 里每 cell 有行数，run 排在 owner 块
-  的最前面，`span_at` = 本组 run 的 owner 块的偏移，每个 rank 各自算），位置 / slot / seq_len
-  逐行递增，输出取末行；**组里没有 run 的 rank 在自己块最前面垫 c 行 pad**（`Layout.lead`）
-  ——var 是全 tray 一份，每个 rank 都跑 span program、都跳过 `[span_at, span_at + c)`，
-  EP4 下 run 落在 rank 1 时 rank 0 若不垫，它自己的第 0 行就被当 span 跳过、又被 span
-  核当 span 算进那条序列的 state（2026-09-03 E3 第一版：8 条相同 prompt 出 8 种答案）。scheduler
-  每步在每个 tp 组里挑最老的还在喂 prompt 的序列各喂一段 run（`runs`，纯函数；2026-09-04 之前整个 tray
-  每步只放一条，t=1 的另外三张卡在 span 步里跑的是 pad），所有 run 一样长：
-  c = min(`--chunk`, manifest 的 `span.max`, 各 run 待喂 token 数的最小值, 每个 rank 的余量)——
-  余量按 rank：放 run 的 rank 是 `seqs.max + 1 − 本卡行数`，垫 lead 的 rank 是 `seqs.max − 本卡行数`；
-  一条短 prompt 会把同步别人的 run 拉短一步，换它自己一步内出首 token，不排在别人后面。
-  其余序列各一行。每 rank 的行数：k ≤ `--max-seqs` 时 bucket 再钉到 max_seqs（原规则），run 超过它时
-  走阶梯（`rows_per_rank`）——同一个 run 不论同步还有什么都落同一个 bucket；cuBLAS 按 m 选核，2k prompt
-  的尾块 223 行不垫到 256、12.9k 的尾块 160 不垫到 192，输出就在近平局处与 K5 线分道（2026-09-04 移植第
-  二轮踩过，t=1 conc1 的 sha 全部对不上，runtime 用 93 层 12.9k oracle 证明是同的）。没有 span program 时
-  逐 token（12.9k 的 prompt 要 12.9k 步）。b>1 走形状包含
+- **没有 prefill program 时 prompt 逐 token 走 step**：`prefill` 可选；没有时 prompt 在 prefix
+  命中之后一步一个 token 地喂，输出丢弃，直到最后一个 prompt token。b>1 走形状包含
   `(b, 1)` 的 program 里 `groups` 上界最紧的那个；没有 chunk program 时 `--rows` 只能是 1。
 - 权重不分 rank 文件：每个 rank 打开同一份 checkpoint（目录 = 全部分片），manifest 的
   bind 按 rank 选行 / 列 / 张量（manifest.md"权重"）。

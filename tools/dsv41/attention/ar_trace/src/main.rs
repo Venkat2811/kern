@@ -102,7 +102,6 @@ fn main() -> anyhow::Result<()> {
                             Fill::Slot => lease.slots(processed..processed + rows),
                             Fill::SeqLen => vec![(processed + rows) as i64],
                             Fill::CuSeqlens => vec![0, rows as i64],
-                            Fill::SpanAt => vec![0],
                             Fill::Blocks => anyhow::bail!("unexpected collective row blocks in DP manifest"),
                             Fill::Tokens | Fill::Count | Fill::Error => continue,
                         };
@@ -157,7 +156,6 @@ fn main() -> anyhow::Result<()> {
                                 Fill::Slot => lease.slots(processed..processed+6),
                                 Fill::SeqLen => vec![(processed+6) as i64],
                                 Fill::CuSeqlens => vec![0, 6],
-                                Fill::SpanAt => vec![0],
                                 Fill::Blocks => anyhow::bail!("unexpected blocks"),
                                 Fill::Tokens | Fill::Count | Fill::Error => continue,
                             };

@@ -398,7 +398,7 @@ fn plan(v: &Verified) -> Result<Plan> {
     let m: &Manifest = v;
     let pr = Protocol::check(v).context("the manifest does not fit the serving protocol")?;
     let chunk = pr.chunk().ok_or_else(|| anyhow::anyhow!("no chunk program: the corpus cannot be fed"))?;
-    let step = pr.forwards.iter().find(|f| matches!(f.rows, Rows::Const(_)) && !f.span).cloned();
+    let step = pr.forwards.iter().find(|f| matches!(f.rows, Rows::Const(_))).cloned();
     let n = m.programs[&chunk.name].calls.len();
     let mut logits: Vec<String> = access(m, &chunk.name, 0..n)
         .writes

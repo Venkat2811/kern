@@ -228,13 +228,6 @@
         "rows": {
           "$ref": "#/$defs/Dim",
           "description": "Rows per sequence: a constant the program's kernels are laid out for (`1` for a decode step, `8` for a speculative round — exact, not a bound), or the var whose value is the row count of the call (`\"tokens\"`: one sequence, as many rows as the chunk)."
-        },
-        "span": {
-          "description": "The var whose value is the length of the call's span: one of the sequences (rows `1` each) feeds a run of that many consecutive tokens, a row each, starting at the row the `span_at` fill names, e.g. `\"span\"` (a prompt chunk riding a decode step). Absent for a call whose sequences all feed `rows`.",
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "required": [
@@ -991,11 +984,6 @@
         {
           "const": "cu_seqlens",
           "description": "Input: exclusive prefix sums of rows per sequence, `groups + 1` entries.",
-          "type": "string"
-        },
-        {
-          "const": "span_at",
-          "description": "Input: the first row of the call's span (`batch.span`), one word; 0 when the call has none.",
           "type": "string"
         },
         {

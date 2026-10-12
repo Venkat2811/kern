@@ -295,12 +295,11 @@ impl<B> Recording<B> {
 }
 
 /// The workload's programs: the chunk program over the prompt, then every
-/// fixed-rows forward without a span in rotation (a caller may switch
-/// between them at any step: same state contract; a span program needs a
-/// run staged by a caller that has one, and the workload stages none).
+/// fixed-rows forward in rotation (a caller may switch between them at any
+/// step: same state contract).
 fn driven(p: &Protocol) -> (Option<Forward>, Vec<Forward>) {
     let chunk = p.chunk().cloned();
-    let steps = p.forwards.iter().filter(|f| matches!(f.rows, Rows::Const(_)) && !f.span).cloned().collect();
+    let steps = p.forwards.iter().filter(|f| matches!(f.rows, Rows::Const(_))).cloned().collect();
     (chunk, steps)
 }
 

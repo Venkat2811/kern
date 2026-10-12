@@ -57,9 +57,6 @@ pub struct Fixture {
     pub slab: bool,
     /// No `decode` program: a prefill-only manifest, whose steps are one-row chunks.
     pub prefill_only: bool,
-    /// A `decode_span` program (one row per group, one group a run of `span`
-    /// rows) beside `decode`: a form the workload does not drive.
-    pub span: bool,
 }
 
 impl Default for Fixture {
@@ -77,7 +74,6 @@ impl Default for Fixture {
             wide_act: false,
             slab: false,
             prefill_only: false,
-            span: false,
         }
     }
 }
@@ -118,9 +114,6 @@ impl Fixture {
     }
     pub fn prefill_only(self) -> Self {
         Fixture { prefill_only: true, ..self }
-    }
-    pub fn span(self) -> Self {
-        Fixture { span: true, ..self }
     }
 
     pub fn manifest(&self) -> Verified {
@@ -175,38 +168,6 @@ impl Fixture {
         if self.prefill_only {
             programs.as_object_mut().unwrap().remove("decode");
         }
-        if self.span {
-            // the run's first row goes to the mix, as a K3 kernel would take it
-            ops.insert(
-                "mix_span".into(),
-                op(
-                    &[
-                        "in buffer<f32>",
-                        "in buffer<i64>",
-                        "in buffer<i32>",
-                        "inout state",
-                        "i32",
-                        "out buffer<f32>",
-                        "in buffer<i32>",
-                    ],
-                    self.mix,
-                ),
-            );
-            let span_calls: Vec<serde_json::Value> = calls
-                .iter()
-                .map(|c| {
-                    if c["op"] == "mix" {
-                        let mut args = c["args"].as_array().unwrap().clone();
-                        args.push(serde_json::json!({"buf": "span_at"}));
-                        serde_json::json!({"op": "mix_span", "args": args})
-                    } else {
-                        c.clone()
-                    }
-                })
-                .collect();
-            programs["decode_span"] =
-                serde_json::json!({"batch": {"groups": 1, "rows": 1, "span": "span"}, "calls": span_calls});
-        }
         if self.probe {
             programs["probe"] = serde_json::json!({"calls": calls});
         }
@@ -246,11 +207,6 @@ impl Fixture {
             "ops": ops,
             "programs": programs,
         });
-        if self.span {
-            m["vars"]["span"] = serde_json::json!({"max": 4});
-            m["buffers"]["span_at"] =
-                serde_json::json!({"kind": "input", "dtype": "i32", "shape": [1], "fill": "span_at"});
-        }
         if ranked {
             m["topology"] = serde_json::json!({"groups": {"ep": self.ranks}});
         }

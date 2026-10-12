@@ -169,9 +169,6 @@ pub struct Batch {
     pub groups: u64,
     /// Rows per sequence: a constant the program's kernels are laid out for (`1` for a decode step, `8` for a speculative round — exact, not a bound), or the var whose value is the row count of the call (`"tokens"`: one sequence, as many rows as the chunk).
     pub rows: Dim,
-    /// The var whose value is the length of the call's span: one of the sequences (rows `1` each) feeds a run of that many consecutive tokens, a row each, starting at the row the `span_at` fill names, e.g. `"span"` (a prompt chunk riding a decode step). Absent for a call whose sequences all feed `rows`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub span: Option<String>,
     /// The var whose value is the length of the call's longest sequence once its rows are in, e.g. `"ctx"`: what a kernel sized by the context rather than by the call runs over (a prefill's expansion of the cached rows). Absent for a program whose kernels are sized by the call alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
@@ -193,8 +190,6 @@ pub enum Fill {
     SeqLen,
     /// Input: exclusive prefix sums of rows per sequence, `groups + 1` entries.
     CuSeqlens,
-    /// Input: the first row of the call's span (`batch.span`), one word; 0 when the call has none.
-    SpanAt,
     /// Input: the tray batch's blocks — exclusive prefix sums of each member's rows in member order, `members + 1` entries, the last the tray's rows.
     Blocks,
     /// Output: the tokens a call produced — one per sequence (`[groups]`) or one per row (`[groups, rows]`, the program's `rows`).
@@ -214,7 +209,6 @@ impl fmt::Display for Fill {
             Fill::Slot => "slot",
             Fill::SeqLen => "seq_len",
             Fill::CuSeqlens => "cu_seqlens",
-            Fill::SpanAt => "span_at",
             Fill::Blocks => "blocks",
             Fill::Tokens => "tokens",
             Fill::Count => "count",

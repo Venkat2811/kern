@@ -826,13 +826,6 @@ fn diagnostics(m: &Manifest) -> Vec<String> {
                     }
                 }
             }
-            if let Some(v) = &batch.span {
-                if m.vars.contains_key(v) {
-                    used_vars.insert(v.clone());
-                } else {
-                    errs.push(format!("program `{pname}`: batch.span names unknown var `{v}`"));
-                }
-            }
             if let Some(v) = &batch.context {
                 if m.vars.contains_key(v) {
                     used_vars.insert(v.clone());

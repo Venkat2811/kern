@@ -40,10 +40,10 @@ _LAUNCH = ["module", "entry", "params", "block", "grid", "shared_mem", "cluster"
 _CALL = ["label", "op", "args"]
 
 
-def program(calls, groups=None, rows=None, span=None, context=None, once=False, graph=False, derive=False):
+def program(calls, groups=None, rows=None, context=None, once=False, graph=False, derive=False):
     """A program object of the wire form: a forward of `groups` sequences of
     `rows` rows each (rows a constant or the name of the var fed per call;
-    `span` the var one sequence's run of rows is sized by; `context` the var
+    `context` the var
     the call's sequences' lengths go in, summed), a
     once-after-load program, a derive program the runtime runs inside
     weight loading over `source` buffers, or a plain one. `graph`: the runtime drives
@@ -51,8 +51,7 @@ def program(calls, groups=None, rows=None, span=None, context=None, once=False, 
     never a variable-row prefill)."""
     p = {}
     if groups is not None:
-        p["batch"] = {"groups": groups, "rows": rows, **({"span": span} if span else {}),
-                      **({"context": context} if context else {})}
+        p["batch"] = {"groups": groups, "rows": rows, **({"context": context} if context else {})}
     if once:
         p["once"] = True
     if derive:

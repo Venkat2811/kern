@@ -45,23 +45,6 @@ fn tray() -> Manifest {
     Manifest::from_json(include_str!("fixtures/tray.json")).unwrap()
 }
 
-/// The plain contract plus a run: a `span` var, the `span_at` word
-/// and a decode step over 4 sequences, one of which may feed a run.
-fn spanned() -> Manifest {
-    let mut m = plain();
-    m.vars.insert("span".into(), serde_json::from_str(r#"{"max": 6}"#).unwrap());
-    m.buffers.insert(
-        "span_at".into(),
-        serde_json::from_str(r#"{"kind": "input", "dtype": "i32", "shape": [1], "fill": "span_at"}"#).unwrap(),
-    );
-    m.ops.insert("read_span".into(), op(&["in buffer<i32>"]));
-    let mut span = m.programs["decode"].clone();
-    span.batch = Some(Batch { groups: 4, rows: Dim::Const(1), span: Some("span".into()), context: None });
-    span.calls.push(serde_json::from_str(r#"{"op": "read_span", "args": [{"buf": "span_at"}]}"#).unwrap());
-    m.programs.insert("decode_span".into(), span);
-    m
-}
-
 /// An op with an extern launch, for a fixture that only needs the ABI.
 fn op(params: &[&str]) -> Op {
     let params: Vec<String> = params.iter().map(|p| format!("\"{p}\"")).collect();
@@ -101,7 +84,6 @@ fn plain_contract() {
     assert_eq!(p.line_tables, vec![LineTable { name: "line_index".into(), lines: 3, width: 1, axis: Axis::Groups }]);
     let names: Vec<(&str, u64, Rows, bool)> =
         p.forwards.iter().map(|f| (f.name.as_str(), f.groups, f.rows, f.emits.is_some())).collect();
-    assert!(p.forwards.iter().all(|f| !f.span));
     assert_eq!(
         names,
         [
@@ -133,19 +115,6 @@ fn speculative_contract() {
     assert_eq!((decode.emits.map(|i| p.fills[i].width), decode.count), (Some(1), None));
 }
 
-#[test]
-fn span_contract() {
-    let p = protocol(&spanned()).unwrap();
-    assert_eq!(p.span, Some(Bound { var: "span".into(), max: 6 }));
-    assert_eq!(p.any(Fill::SpanAt).map(|f| (f.name.as_str(), f.axis)), Some(("span_at", Axis::Fixed(1))));
-    // A call with a run goes through the span program, one without
-    // through the plain ones; the span program is no plain shape.
-    assert_eq!(p.spanned(3).map(|f| f.name.as_str()), Some("decode_span"));
-    assert_eq!(p.forward(3, Rows::Const(1)).map(|f| f.name.as_str()), Some("decode_batch"));
-    assert_eq!((p.spanned(5), p.row_shapes(), p.max_groups(Rows::Const(1))), (None, vec![1], 4));
-    assert_eq!(protocol(&plain()).unwrap().span, None);
-}
-
 /// The plain contract plus a program sized by its context: the prefill
 /// chunk's `batch` names `ctx`, a var nothing else reads.
 fn contextual() -> Manifest {
@@ -170,30 +139,6 @@ fn context_contract() {
     m.vars.insert("other".into(), serde_json::from_str(r#"{"max": 2}"#).unwrap());
     m.programs.get_mut("decode").unwrap().batch.as_mut().unwrap().context = Some("other".into());
     rejects(&m, "one var bounds every context");
-}
-
-#[test]
-fn span_rules() {
-    let mut m = spanned();
-    m.programs.get_mut("decode_span").unwrap().batch.as_mut().unwrap().rows = Dim::Const(4);
-    rejects(&m, "a span rides a call of one row per sequence, not `4`");
-    let mut m = spanned();
-    m.programs.get_mut("decode_span").unwrap().batch.as_mut().unwrap().span = Some("tokens".into());
-    m.vars.remove("span");
-    rejects(&m, "batch.span is `tokens`, which sizes the call itself");
-    let mut m = spanned();
-    m.vars.get_mut("span").unwrap().max = 9;
-    rejects(&m, "a run of 9 rows (`span`) exceeds the 8 rows `tokens` allows");
-    let mut m = spanned();
-    m.buffers.get_mut("span_at").unwrap().fill = None;
-    rejects(&m, "no input has fill `span_at`");
-    let mut m = spanned();
-    m.buffers.get_mut("span_at").unwrap().shape = vec![Dim::Const(2)];
-    rejects(&m, "expected i32 [1]");
-    let mut m = spanned();
-    m.vars.insert("other".into(), serde_json::from_str(r#"{"max": 2}"#).unwrap());
-    m.programs.get_mut("decode").unwrap().batch.as_mut().unwrap().span = Some("other".into());
-    rejects(&m, "one var sizes every run");
 }
 
 #[test]
@@ -257,16 +202,14 @@ fn shape_rules() {
 #[test]
 fn batch_rules() {
     let mut m = plain();
-    m.programs.get_mut("decode_batch").unwrap().batch =
-        Some(Batch { groups: 5, rows: Dim::Const(1), span: None, context: None });
+    m.programs.get_mut("decode_batch").unwrap().batch = Some(Batch { groups: 5, rows: Dim::Const(1), context: None });
     rejects(&m, "5 groups exceed the 4");
     let mut m = plain();
-    m.programs.get_mut("decode_batch").unwrap().batch =
-        Some(Batch { groups: 4, rows: Dim::Const(3), span: None, context: None });
+    m.programs.get_mut("decode_batch").unwrap().batch = Some(Batch { groups: 4, rows: Dim::Const(3), context: None });
     rejects(&m, "4 sequences of 3 rows exceed the 8");
     let mut m = plain();
     m.programs.get_mut("prefill").unwrap().batch =
-        Some(Batch { groups: 2, rows: Dim::Var("tokens".into()), span: None, context: None });
+        Some(Batch { groups: 2, rows: Dim::Var("tokens".into()), context: None });
     let p = protocol(&m).unwrap();
     let prefill = p.forwards.iter().find(|f| f.name == "prefill").unwrap();
     assert_eq!((prefill.groups, prefill.rows), (2, Rows::Var));
@@ -274,11 +217,10 @@ fn batch_rules() {
     rejects(&m, "needs a `cu_seqlens` fill to split them");
     let mut m = plain();
     m.programs.get_mut("prefill").unwrap().batch =
-        Some(Batch { groups: 1, rows: Dim::Var("seqs".into()), span: None, context: None });
+        Some(Batch { groups: 1, rows: Dim::Var("seqs".into()), context: None });
     rejects(&m, "the rows of a call go in `tokens`");
     let mut m = plain();
-    m.programs.get_mut("decode_batch").unwrap().batch =
-        Some(Batch { groups: 1, rows: Dim::Const(1), span: None, context: None });
+    m.programs.get_mut("decode_batch").unwrap().batch = Some(Batch { groups: 1, rows: Dim::Const(1), context: None });
     rejects(&m, "accept the same call shape");
     let mut m = plain();
     for p in m.programs.values_mut() {
@@ -299,8 +241,7 @@ fn batch_rules() {
 fn what_a_forward_hands_back_is_dataflow() {
     // A round handing back 4 per sequence must be a 4-row call.
     let mut m = speculative();
-    m.programs.get_mut("round").unwrap().batch =
-        Some(Batch { groups: 2, rows: Dim::Const(3), span: None, context: None });
+    m.programs.get_mut("round").unwrap().batch = Some(Batch { groups: 2, rows: Dim::Const(3), context: None });
     rejects(&m, "hands back `verify_tokens` of 4 per sequence, but a call has 3 rows");
     // A count needs several tokens per sequence to count.
     let mut m = speculative();

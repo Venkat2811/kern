@@ -345,7 +345,7 @@ program 接受几组几行、跑完从哪读 token。v3 把这层写在 caller �
 
 - **buffer 上的 `fill`**：这个 buffer 在循环里的角色。input：`token`
   （每行一个；形如 `[seqs]` 时每组一个，即投机轮的 anchor）、`position`、
-  `slot`、`seq_len`、`cu_seqlens`、`span_at`、`blocks`（tray batch 各成员的块：
+  `slot`、`seq_len`、`cu_seqlens`、`blocks`（tray batch 各成员的块：
   按成员序的行数前缀和，`[t + 1]` 个 i32，末项是 tray 的行数；块不必等长，
   collective 核按它把本卡行号换算成 tray 行号）；output：`tokens`（`[seqs]`
   每组一个，`[seqs, r]` 每行一个）、`count`（每组取几个，缺省恒 1）、`error`
@@ -357,10 +357,6 @@ program 接受几组几行、跑完从哪读 token。v3 把这层写在 caller �
   名}`——这个 program 接受"几组、每组几行"的调用。`rows` 是精确值（round
   的 7 行是 mask 布局，喂 3 行就是错的）；是 var 名（`"tokens"`）时只能
   一组，行数就是这次调用的 var 值（prefill 的 chunk 随末块变短）。可选的
-  `"span": var 名`（K5，`{"groups": 256, "rows": 1, "span": "span"}`）：
-  这是一个每组 1 行的 decode 步，其中**一组**可以喂一段 run——同一序列的
-  连续 token 各占一行，run 的长度是这次调用的 `span` 值、首行写进 `span_at`
-  fill 的 `[1]` i32 输入（没有 run 时写 0）；只有带 run 的调用走它。可选的
   `"context": var 名`（K13）：这个 program 里有按上下文而不是按本次调用
   定尺寸的 kernel（prefill 把序列缓存的 latent 行全部展开），driver 把这次
   调用最长序列**含本次行**的长度写进该 var——它本来就从自己 stage 的
@@ -390,23 +386,20 @@ caller 认得的。读这层的是 `kern_manifest::Protocol::check(&Manifest)`
 （纯函数，不碰 GPU，verify 之后的第二遍）：有 `batch` 就得有 rows 与
 groups 两根轴的 var、每个 fill 至多一个 buffer、形状与角色相符、
 `[seqs, r]` 的 `tokens` 的 r 是某个 `batch` 的 `rows`、`count` 只在有它时
-合法、两个 program 不得同形状（span 算形状的一部分）、`groups × rows ≤
-tokens.max`、`span` 只落在 `rows: 1` 的 program 上、全 manifest 一个 span
-var 且 `span.max ≤ tokens.max`、有 span 就得有 `span_at` fill、`context`
-不得是行 / 组 / span 的 var 且全 manifest 一个、至少一个
+合法、两个 program 不得同形状、`groups × rows ≤ tokens.max`、`context`
+不得是行 / 组的 var 且全 manifest 一个、至少一个
 `batch` program。得到的 `Protocol` 是只读投影：`forward(groups, rows)`
 选形状包含 `(b, r)` 的 program 里 `groups` 上界最紧的那个，`chunk()` 是
-接受 `(1, var)` 的那个，`spanned(b)` 是接受 b 组、其中一组带 run 的那个，
-`vars(b, per, t, longest)` 是一次调用的 var 表（run 的 `span` 由 caller
-加，`longest` 落进 context var），每个
+接受 `(1, var)` 的那个，
+`vars(b, per, t, longest)` 是一次调用的 var 表（`longest` 落进 context
+var），每个
 `Filled` 带 dtype 与轴，每个 `Forward` 知道自己 emit 不 emit token、按哪
 个 `count` 取。`kern verify <manifest>` 打印这层事实；kern-run 与
 kern-serve 只拿 `Protocol` 驱动 runtime，不读 JSON（CI 用 grep 保证它们
 的代码里没有 fill / program / var / buffer 的名字面量）。
 
 一步的形状因此统一：prefill 是"1 组 c 行"，decode 是"b 组 1 行"，投机轮
-是"b 组 r 行、每组取 `count` 个"，span 是"b 组 1 行、其中一组 c 行"——同一
-段代码，`--rows` 选每组行数（缺省取 manifest 声明的最宽）。设计与取舍见
+是"b 组 r 行、每组取 `count` 个"——同一段代码，`--rows` 选每组行数（缺省取 manifest 声明的最宽）。设计与取舍见
 [v4-design.md](v4-design.md)。
 
 ## 流水线切分：`kern cut`

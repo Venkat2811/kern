@@ -20,14 +20,7 @@
 //! token is the first step's input. Without such a forward the prompt
 //! goes through one-row steps, a token at a time — a row feeding its
 //! prompt is a row like any other, whose outputs are dropped until the
-//! last prompt token is in — or, when the manifest takes a run (a
-//! `span`, see `tray.rs`), in every tray group the oldest sequence still
-//! feeding its prompt feeds a run of up to `--chunk` of its tokens as
-//! consecutive rows of the step, the run's last row handing its token
-//! back; the runs of a step are one length, the shortest any of them can
-//! feed, since the span var is one value for the tray. That is what a
-//! decode-only tray manifest (K3 today) gets: correct, and slow without
-//! the run.
+//! last prompt token is in.
 //!
 //! Policy, deliberately simple:
 //! - prefill first: each step admits every waiting request it can seat,
@@ -112,50 +105,11 @@ use crate::logline;
 use crate::tray::{Cell, Rising, Row, Sleeping, Snapshot, Tray};
 
 /// Decode batch buckets; a batch is padded up to the smallest one that
-/// fits and each bucket owns one captured graph. The steps past 256 are
-/// a tray's: a full run and a row or two on each other rank, padded by
-/// a few rows rather than a block (cutting the run instead costs a whole
-/// step whenever a prompt's remainder spills over).
-const BUCKETS: [usize; 23] =
-    [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 264, 272, 288, 304, 320, 384, 512, 640, 768, 1024];
+/// fits and each bucket owns one captured graph.
+const BUCKETS: [usize; 18] = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 640, 768, 1024];
 
 fn bucket(n: usize) -> usize {
     BUCKETS.iter().copied().find(|&b| b >= n).unwrap_or(n)
-}
-
-/// Rows per rank for a step of `k` rows: the bucket, capped at `cap`
-/// (`--max-seqs`) for a step of sequences; a run of more rows than that
-/// keeps the ladder, since the same run has to land on the same bucket
-/// whatever else is in the step (cuBLAS picks its kernel by m).
-fn rows_per_rank(k: usize, cap: usize) -> usize {
-    match k > cap {
-        true => bucket(k),
-        false => bucket(k).min(cap),
-    }
-}
-
-/// A step's runs: in each tray group of `t` of the `n` ranks the oldest
-/// sequence still feeding its prompt feeds one, and every run is as long
-/// as the shortest of them can feed, within `cap`, since the span var is
-/// one value for the tray. `seqs[i] = (rank, tokens it can feed)` in age
-/// order; a rank holds `limit` rows, and a run's rows replace its one
-/// (a group without a run leads with as many padding rows). `(c, the
-/// runners)`: `(1, [])` when nothing is a run.
-fn runs(seqs: &[(usize, usize)], n: usize, t: usize, limit: usize, cap: usize) -> (usize, Vec<usize>) {
-    let runners: Vec<usize> = (0..n / t).filter_map(|g| seqs.iter().position(|&(q, a)| q / t == g && a > 1)).collect();
-    let on = |q: usize| seqs.iter().filter(|&&(r, _)| r == q).count();
-    let owns = |q: usize| runners.iter().any(|&i| seqs[i].0 == q);
-    let leads = |q: usize| q.is_multiple_of(t) && !(q..q + t).any(owns);
-    let room = (0..n).filter_map(|q| match (owns(q), leads(q)) {
-        (true, _) => Some((limit + 1).saturating_sub(on(q))),
-        (_, true) => Some(limit.saturating_sub(on(q))),
-        _ => None,
-    });
-    let c = runners.iter().map(|&i| seqs[i].1).chain(room).chain(std::iter::once(cap)).min().unwrap_or(1);
-    match c > 1 && !runners.is_empty() {
-        true => (c, runners),
-        false => (1, Vec::new()),
-    }
 }
 
 pub struct Policy {
@@ -185,9 +139,6 @@ struct Plan {
     /// The forward a prompt chunk goes through, `None` when the prompt
     /// goes through steps.
     chunk: Option<Forward>,
-    /// Most rows one sequence may feed as a run in a one-row step, when
-    /// the manifest takes one at every batch size up to `max_seqs`.
-    span: Option<usize>,
     /// Concurrent sequences per rank.
     max_seqs: usize,
 }
@@ -221,9 +172,7 @@ impl Plan {
             .min(p.rows.max as usize / rows as usize)
             .min(p.max_groups(Rows::Const(rows)) as usize)
             .max(1);
-        let span =
-            p.span.as_ref().filter(|_| rows == 1 && p.spanned(max_seqs as u64).is_some()).map(|s| s.max as usize);
-        Ok(Plan { rows, step, chunk, span, max_seqs })
+        Ok(Plan { rows, step, chunk, max_seqs })
     }
 
     /// Rows a step writes past the token it feeds: what a lease holds past
@@ -511,7 +460,6 @@ impl KernScheduler {
             buckets = ?BUCKETS.iter().filter(|&&b| b <= policy.max_seqs).collect::<Vec<_>>(),
             rows = plan.rows,
             step = %plan.step.name,
-            span = plan.span,
             steps = ?tray.protocol().forwards.iter().filter(|f| f.rows == plan.step.rows).map(|f| (f.name.as_str(), f.groups)).collect::<Vec<_>>(),
             prefill = match &plan.chunk {
                 Some(f) if f.emits.is_some() => format!("`{}`, emits the first token", f.name),
@@ -857,10 +805,7 @@ impl KernScheduler {
 
     /// One step over every running sequence: `rows` rows per sequence at
     /// its position, the forward the protocol picks for the batch, and
-    /// what it hands each sequence back. Under a span each tray group's
-    /// oldest sequence still feeding its prompt feeds a run of up to
-    /// `--chunk` tokens within the rows bound ([`runs`]); only a run's
-    /// last output matters, as with a prefill chunk.
+    /// what it hands each sequence back.
     fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
         self.drop_aborted(ledger);
         if self.running.is_empty() {
@@ -868,34 +813,15 @@ impl KernScheduler {
         }
         let rows = self.plan.rows;
         let t0 = Instant::now();
-        let (c, runners) = match self.plan.span {
-            Some(mx) => {
-                let seqs: Vec<(usize, usize)> =
-                    self.running.iter().map(|s| (s.row.owner().index(), 1 + s.pending.len())).collect();
-                let (n, t, limit) = (self.tray.len(), self.tray.group_size(), self.tray.seqs_max());
-                runs(&seqs, n, t, limit, mx.min(self.chunk))
-            }
-            None => (1, Vec::new()),
-        };
         let max_seqs = self.policy.max_seqs;
-        // What each sequence feeds: its next token `rows` times, or a
-        // runner's next and the `c - 1` prompt tokens after it.
-        let fed: Vec<Vec<u32>> = self
-            .running
-            .iter_mut()
-            .enumerate()
-            .map(|(i, s)| match runners.contains(&i) {
-                true => std::iter::once(s.next).chain(s.pending.drain(..c - 1)).collect(),
-                false => vec![s.next; rows as usize],
-            })
-            .collect();
+        // Each sequence feeds its next token `rows` times; a speculative
+        // round drafts the rows past the first on the device.
         let cells: Vec<Cell> = self
             .running
             .iter()
-            .zip(&fed)
-            .map(|(s, ids)| Cell { row: &s.row, ids: ids.iter().map(|&t| t as i64).collect(), pos: s.pos })
+            .map(|s| Cell { row: &s.row, ids: vec![s.next as i64; rows as usize], pos: s.pos })
             .collect();
-        let mut st = self.tray.stage(&cells, rows as usize, |k| rows_per_rank(k, max_seqs))?;
+        let mut st = self.tray.stage(&cells, rows as usize, |k| bucket(k).min(max_seqs))?;
         let f = st.forward(rows).expect("planned: every bucket up to max_seqs has a forward");
         st.run(&f)?;
         let out = st.emitted(&f)?;
@@ -906,8 +832,6 @@ impl KernScheduler {
         let running = std::mem::take(&mut self.running);
         for (i, mut s) in running.into_iter().enumerate() {
             let toks: Vec<u32> = out[i].iter().map(|&t| t as u32).collect();
-            // The tokens in the state now: the run's, or the one fed.
-            let fed = if runners.contains(&i) { fed[i].clone() } else { vec![s.next] };
             if let Some(c) = &mut self.counters {
                 // The first token is the next input's answer; the rest are
                 // accepted drafts.
@@ -923,17 +847,16 @@ impl KernScheduler {
             // dropped, the next prompt token is the next input.
             let done = match s.pending.pop_front() {
                 Some(t) => {
-                    self.stats.prefill_tokens += fed.len() as u64;
-                    s.advance(fed);
+                    self.stats.prefill_tokens += 1;
+                    s.advance([s.next]);
                     s.next = t;
                     false
                 }
                 None => {
                     // The tokens taken are in the state now: what was fed
                     // and every accepted one after it.
-                    self.stats.prefill_tokens += fed.len() as u64 - 1;
                     let taken = toks.len().max(1);
-                    s.advance(fed.into_iter().chain(toks[..taken - 1].iter().copied()));
+                    s.advance(std::iter::once(s.next).chain(toks[..taken - 1].iter().copied()));
                     let (n, done) = s.emit(&toks, ledger);
                     self.stats.tokens += n;
                     done
@@ -1034,36 +957,6 @@ mod tests {
     use kern_manifest::verify;
 
     #[test]
-    fn rows_per_rank_keeps_the_ladder_for_a_run() {
-        assert_eq!((rows_per_rank(5, 6), rows_per_rank(6, 6), rows_per_rank(16, 16)), (6, 6, 16));
-        assert_eq!(
-            (rows_per_rank(17, 16), rows_per_rank(160, 16), rows_per_rank(223, 16), rows_per_rank(256, 16)),
-            (24, 192, 256, 256)
-        );
-    }
-
-    #[test]
-    fn every_group_runs_its_oldest_prompt_at_one_length() {
-        // Four ranks alone (t=1): the oldest prompt of each rank runs,
-        // all as long as the shortest can feed; a rank with none leads
-        // with padding, so its rows bound the length too.
-        let seqs = [(0, 1), (1, 9), (0, 5), (2, 1), (1, 7), (3, 3)];
-        assert_eq!(runs(&seqs, 4, 1, 16, 256), (3, vec![2, 1, 5]));
-        assert_eq!(runs(&seqs, 4, 1, 16, 2), (2, vec![2, 1, 5]));
-        // Room: a runner's rows replace its one (rank 0 holds 2, so 15
-        // more fit), a leading rank's add to its own (rank 2 holds 1).
-        assert_eq!(runs(&[(0, 100), (0, 1), (2, 1)], 4, 1, 16, 256), (15, vec![0]));
-        assert_eq!(runs(&[(0, 100), (2, 1)], 3, 1, 4, 256), (3, vec![0]));
-        // One group of four: one run, the oldest; its peers' rows are not
-        // in the way and no group leads.
-        assert_eq!(runs(&[(3, 1), (1, 9), (0, 5)], 4, 4, 16, 256), (9, vec![1]));
-        // Nothing to run, or no room for a run of two.
-        assert_eq!(runs(&[(0, 1), (1, 1)], 2, 1, 16, 256), (1, vec![]));
-        assert_eq!(runs(&[(0, 9), (1, 1)], 2, 1, 1, 256), (1, vec![]));
-        assert_eq!(runs(&[], 2, 1, 16, 256), (1, vec![]));
-    }
-
-    #[test]
     fn a_sequence_takes_tokens_through_its_stop_or_its_length() {
         use pegainfer_frontend::engine::EosPolicy;
         let stop = StopPolicy::new(EosPolicy::Token(9), vec![7]);
@@ -1115,21 +1008,6 @@ mod tests {
         Manifest::from_json(&v.to_string()).unwrap()
     }
 
-    /// The plain contract plus a run: `decode_span` takes 4 sequences of
-    /// one row, one of them up to 6 rows.
-    fn spanned() -> Manifest {
-        let mut v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&plain()).unwrap()).unwrap();
-        v["vars"]["span"] = serde_json::json!({"max": 6});
-        v["buffers"]["span_at"] = serde_json::json!({"kind": "input", "dtype": "i32", "shape": [1], "fill": "span_at"});
-        v["ops"]["read_span"] =
-            serde_json::json!({"params": ["in buffer<i32>"], "impl": {"launches": [{"entry": "extern:x"}]}});
-        let mut calls = v["programs"]["decode"]["calls"].clone();
-        calls.as_array_mut().unwrap().push(serde_json::json!({"op": "read_span", "args": [{"buf": "span_at"}]}));
-        v["programs"]["decode_span"] =
-            serde_json::json!({"batch": {"groups": 4, "rows": 1, "span": "span"}, "calls": calls});
-        Manifest::from_json(&v.to_string()).unwrap()
-    }
-
     fn check(m: &Manifest, page: usize, rows: Option<u64>, seqs: usize) -> Result<Plan> {
         Plan::check(&Protocol::check(&verify(m.clone())?)?, page, 4, rows, seqs)
     }
@@ -1161,20 +1039,7 @@ mod tests {
         m.programs.remove("prefill");
         m.ops.remove("write");
         let p = check(&m, 16, None, 4).unwrap();
-        assert_eq!((p.chunk, p.rows, p.span), (None, 1, None));
-    }
-
-    #[test]
-    fn a_run_when_the_manifest_takes_one_at_every_batch_size() {
-        assert_eq!(check(&spanned(), 16, None, 4).unwrap().span, Some(6));
-        // Not past the span program's sequences bound, nor in a several-row step.
-        let mut m = spanned();
-        m.programs.get_mut("decode_span").unwrap().batch.as_mut().unwrap().groups = 2;
-        assert_eq!((check(&m, 16, None, 4).unwrap().span, check(&m, 16, None, 2).unwrap().span), (None, Some(6)));
-        let mut m = spanned();
-        m.programs.get_mut("decode_span").unwrap().batch.as_mut().unwrap().groups = 2;
-        assert_eq!(check(&m, 16, None, 2).unwrap().span, Some(6));
-        assert_eq!(check(&plain(), 16, None, 4).unwrap().span, None);
+        assert_eq!((p.chunk, p.rows), (None, 1));
     }
 
     #[test]
