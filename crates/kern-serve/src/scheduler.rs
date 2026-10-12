@@ -737,8 +737,8 @@ impl KernScheduler {
 
     /// The `key.len()` tokens `row` holds, which `key` names, as a snapshot
     /// of its recurrent state. `Busy` makes room and retries, `Remapping`
-    /// waits for the slot on its way (the prefill just read its output
-    /// back, so the stream the remap waits on is drained; what is left is
+    /// waits for the slot on its way (the prefill's run synchronized every
+    /// rank, so the stream the remap waits on is drained; what is left is
     /// the remap's own milliseconds); with nothing left to make room with
     /// or any other denial, the request runs on without it.
     fn keep_prompt(&mut self, row: &mut Row, key: &[i64], id: RequestId) -> Result<()> {
