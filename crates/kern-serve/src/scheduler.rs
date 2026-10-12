@@ -104,7 +104,7 @@ use kern_pool::{Denied, Evicted, Found, Prefix, Tier};
 use kern_runtime::Error;
 use pegainfer_frontend::engine::{
     FinishReason, QueuedRequest, RejectReason, RequestId, RequestLedger, Scheduler, SchedulerMetrics,
-    SpecDecodeCounters, StopPolicy, MAX_SPEC_TOKENS,
+    SpecDecodeCounters, StopCause, StopPolicy, MAX_SPEC_TOKENS,
 };
 use tracing::{debug, info, warn};
 
@@ -247,9 +247,12 @@ struct Seq {
     /// Prompt tokens still to feed after `next`, one per step, when the
     /// prompt goes through decode; the outputs of those steps are dropped.
     pending: VecDeque<u32>,
+    /// Tokens counted against `max_tokens`, the stop token included; what
+    /// a speculative round accepted past it or `max_tokens` is not.
     generated: usize,
-    /// Tokens the client got: `generated` less the stop token and whatever
-    /// a speculative round accepted past `max_tokens` or the stop.
+    /// Tokens the client got as text: `generated` less the stop token.
+    /// The state can hold more (a round's accepted tokens past the end),
+    /// which is what `finish` checks against.
     emitted: usize,
     max_tokens: usize,
     /// The request's EOS and explicit stop ids, as the frontend lowered
@@ -276,46 +279,35 @@ impl Seq {
         }
     }
 
-    /// Account `toks` as generated, in order: each is emitted until a stop
-    /// token or `max_tokens`. The stop token goes to the ledger with its
-    /// cause (pegainfer convention: the frontend counts it as vLLM does and
-    /// strips it from the text) but not into `emitted`. Finishes the request
-    /// in the ledger when it is done, otherwise the last token is the next
-    /// step's input. Returns how many tokens were emitted and whether the
-    /// sequence finished.
+    /// Account `toks` as generated, as far as [`cut`] takes them. The stop
+    /// token goes to the ledger with its cause (pegainfer convention: the
+    /// frontend counts it as vLLM does and strips it from the text) but not
+    /// into `emitted`. Finishes the request in the ledger when it is done,
+    /// otherwise the last token is the next step's input. Returns how many
+    /// tokens were emitted and whether the sequence finished.
     fn emit(&mut self, toks: &[u32], ledger: &mut RequestLedger) -> (u64, bool) {
-        let mut out = Vec::with_capacity(toks.len());
-        let mut reason = None;
-        let mut cause = None;
-        for &tok in toks {
-            self.generated += 1;
-            out.push(tok);
-            if let Some(c) = self.stop.classify(tok, |_| false) {
-                reason = Some(FinishReason::Stop);
-                cause = Some(c);
-                break;
-            }
-            if self.generated >= self.max_tokens {
-                reason = Some(FinishReason::Length);
-                break;
-            }
-        }
-        let emitted = out.len() - cause.is_some() as usize;
+        let (taken, end) = cut(toks, self.generated, self.max_tokens, &self.stop);
+        let emitted = taken - matches!(end, Some(End::Stop(_))) as usize;
+        self.generated += taken;
         self.emitted += emitted;
-        if !out.is_empty() {
-            ledger.push_tokens(self.id, &out, &[]);
+        if taken > 0 {
+            ledger.push_tokens(self.id, &toks[..taken], &[]);
         }
-        let done = match reason {
-            Some(r) => {
+        let done = match end {
+            Some(end) => {
+                let (reason, cause) = match end {
+                    End::Stop(c) => (FinishReason::Stop, Some(c)),
+                    End::Length => (FinishReason::Length, None),
+                };
                 debug!(
                     request = %self.id,
-                    reason = ?r,
+                    reason = ?reason,
                     prompt = self.prompt_len,
                     generated = self.generated,
                     elapsed_s = logline::secs(self.admitted.elapsed()),
                     "finished"
                 );
-                ledger.finish_with_cause(self.id, r, cause);
+                ledger.finish_with_cause(self.id, reason, cause);
                 true
             }
             None => {
@@ -327,6 +319,27 @@ impl Seq {
         };
         (emitted as u64, done)
     }
+}
+
+/// Why a sequence's tokens end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    Stop(StopCause),
+    Length,
+}
+
+/// How many of `toks` a sequence that has generated `generated` of
+/// `max_tokens` takes: through the first stop token or the one reaching
+/// `max_tokens`, and why it ends there; all of them and `None` otherwise.
+/// A stop token wins over `max_tokens` when it is both.
+fn cut(toks: &[u32], generated: usize, max_tokens: usize, stop: &StopPolicy) -> (usize, Option<End>) {
+    toks.iter()
+        .enumerate()
+        .find_map(|(i, &t)| match stop.classify(t, |_| false) {
+            Some(c) => Some((i + 1, End::Stop(c))),
+            None => (generated + i + 1 >= max_tokens).then_some((i + 1, End::Length)),
+        })
+        .map_or((toks.len(), None), |(n, end)| (n, Some(end)))
 }
 
 pub struct KernScheduler {
@@ -1048,6 +1061,37 @@ mod tests {
         assert_eq!(runs(&[(0, 1), (1, 1)], 2, 1, 16, 256), (1, vec![]));
         assert_eq!(runs(&[(0, 9), (1, 1)], 2, 1, 1, 256), (1, vec![]));
         assert_eq!(runs(&[], 2, 1, 16, 256), (1, vec![]));
+    }
+
+    #[test]
+    fn a_sequence_takes_tokens_through_its_stop_or_its_length() {
+        use pegainfer_frontend::engine::EosPolicy;
+        let stop = StopPolicy::new(EosPolicy::Token(9), vec![7]);
+        assert_eq!(cut(&[1, 2, 3], 0, 10, &stop), (3, None));
+        assert_eq!(cut(&[1, 9, 3], 0, 10, &stop), (2, Some(End::Stop(StopCause::Eos(9)))));
+        assert_eq!(cut(&[1, 2, 3], 8, 10, &stop), (2, Some(End::Length)));
+        assert_eq!(cut(&[1, 7], 8, 10, &stop), (2, Some(End::Stop(StopCause::Token(7)))));
+        assert_eq!(cut(&[], 0, 10, &stop), (0, None));
+        // Every token string over {plain, stop, eos} up to four long, at
+        // every count already generated short of the limit.
+        let alphabet = [1u32, 7, 9];
+        let strings = (0..=4u32).flat_map(|n| {
+            (0..3usize.pow(n)).map(move |k| (0..n).map(|i| alphabet[k / 3usize.pow(i) % 3]).collect::<Vec<_>>())
+        });
+        for toks in strings {
+            for (generated, max) in (1..=5).flat_map(|m| (0..m).map(move |g| (g, m))) {
+                let (taken, end) = cut(&toks, generated, max, &stop);
+                let stops = |s: &[u32]| s.iter().filter(|&&t| t != 1).count();
+                let fact = match end {
+                    None => taken == toks.len() && stops(&toks) == 0 && generated + taken < max,
+                    Some(End::Stop(_)) => {
+                        stops(&toks[..taken]) == 1 && toks[taken - 1] != 1 && generated + taken <= max
+                    }
+                    Some(End::Length) => stops(&toks[..taken]) == 0 && generated + taken == max,
+                };
+                assert!(fact, "{toks:?} at {generated}/{max}: ({taken}, {end:?})");
+            }
+        }
     }
 
     /// The plain contract of kern-manifest's own tests: a prefill chunk
