@@ -17,10 +17,7 @@
 //! forward hands a token back (a hybrid GDN model, whose chunked kernels
 //! must see every prompt token) every prompt token goes through it and
 //! the first generated token comes from it, otherwise the last prompt
-//! token is the first step's input. Without such a forward the prompt
-//! goes through one-row steps, a token at a time — a row feeding its
-//! prompt is a row like any other, whose outputs are dropped until the
-//! last prompt token is in.
+//! token is the first step's input.
 //!
 //! Policy, deliberately simple:
 //! - prefill first: each step admits every waiting request it can seat,
@@ -136,9 +133,8 @@ struct Plan {
     /// The forward that takes one sequence of `rows` rows; a batch of `b`
     /// runs the one the protocol picks for `(b, rows)`.
     step: Forward,
-    /// The forward a prompt chunk goes through, `None` when the prompt
-    /// goes through steps.
-    chunk: Option<Forward>,
+    /// The forward a prompt chunk goes through.
+    chunk: Forward,
     /// Concurrent sequences per rank.
     max_seqs: usize,
 }
@@ -161,12 +157,9 @@ impl Plan {
         if rows as usize - 1 > MAX_SPEC_TOKENS {
             bail!("{} rows past the first per step, the frontend's metrics hold {MAX_SPEC_TOKENS}", rows - 1);
         }
-        let chunk = p.chunk().cloned();
-        if chunk.is_none() && rows > 1 {
-            bail!(
-                "no program takes a prompt chunk, so prompts go through steps, which takes one-row steps, not {rows}"
-            );
-        }
+        let Some(chunk) = p.chunk().cloned() else {
+            bail!("no program takes one sequence of as many rows as fed: nothing to feed a prompt through")
+        };
         let max_seqs = want_seqs
             .clamp(1, seqs_max)
             .min(p.rows.max as usize / rows as usize)
@@ -193,9 +186,6 @@ struct Seq {
     pos: usize,
     /// The token the next decode step feeds at `pos`.
     next: u32,
-    /// Prompt tokens still to feed after `next`, one per step, when the
-    /// prompt goes through decode; the outputs of those steps are dropped.
-    pending: VecDeque<u32>,
     /// Tokens counted against `max_tokens`, the stop token included; what
     /// a speculative round accepted past it or `max_tokens` is not.
     generated: usize,
@@ -321,7 +311,7 @@ struct Stats {
     step_ns: u128,
     /// Tokens emitted to the ledger.
     tokens: u64,
-    /// Prompt tokens fed: through the chunk forward (timed) or through steps.
+    /// Prompt tokens fed through the chunk forward, and their time.
     prefill_tokens: u64,
     prefill_ns: u128,
     /// Prompt tokens found in a snapshot, and snapshots evicted for room.
@@ -461,10 +451,9 @@ impl KernScheduler {
             rows = plan.rows,
             step = %plan.step.name,
             steps = ?tray.protocol().forwards.iter().filter(|f| f.rows == plan.step.rows).map(|f| (f.name.as_str(), f.groups)).collect::<Vec<_>>(),
-            prefill = match &plan.chunk {
-                Some(f) if f.emits.is_some() => format!("`{}`, emits the first token", f.name),
-                Some(f) => format!("`{}`, state only", f.name),
-                None => "through steps".to_string(),
+            prefill = match plan.chunk.emits {
+                Some(_) => format!("`{}`, emits the first token", plan.chunk.name),
+                None => format!("`{}`, state only", plan.chunk.name),
             },
             checkpoints = if self.every_page { "every page" } else { "at history end and request end" },
             host_gib_per_rank = (policy.host_bytes > 0).then_some(policy.host_bytes >> 30),
@@ -605,37 +594,29 @@ impl KernScheduler {
         // (`prompt_tokens_details.cached_tokens`), zero included, so a caller
         // can tell a miss from an engine that does not report hits.
         ledger.set_cached_tokens(id, start);
-        // With a chunk forward every prompt token goes through it when it
-        // hands the first generated token back itself; otherwise
-        // everything but the last, which is the first step's input. A
-        // snapshot hit skips its tokens (never the last one). Without one
-        // the prompt past the hit is fed a token per step. A recurrent
-        // state is kept where the frontend says the next turn parts from
-        // this prompt, so the prefill stops there once.
-        let (n_pre, first, pending) = match self.plan.chunk.clone() {
-            Some(f) => {
-                let n_pre = if f.emits.is_some() { prompt } else { prompt - 1 };
-                let mark = (!self.every_page)
-                    .then_some(q.request.history_tokens)
-                    .flatten()
-                    .filter(|&m| m > start && m <= n_pre);
-                let first = match mark {
-                    Some(m) => {
-                        let first = self.prefill(&f, &row, &ids[..m], start)?;
-                        self.keep_prompt(&mut row, &ids[..m], id)?;
-                        match m < n_pre {
-                            true => self.prefill(&f, &row, &ids[..n_pre], m)?,
-                            false => first,
-                        }
-                    }
-                    None => self.prefill(&f, &row, &ids[..n_pre], start)?,
-                };
-                self.stats.prefill_ns += t0.elapsed().as_nanos();
-                self.stats.prefill_tokens += (n_pre - start) as u64;
-                (n_pre, first, VecDeque::new())
+        // Every prompt token goes through the chunk forward when it hands
+        // the first generated token back itself; otherwise everything but
+        // the last, which is the first step's input. A snapshot hit skips
+        // its tokens (never the last one). A recurrent state is kept where
+        // the frontend says the next turn parts from this prompt, so the
+        // prefill stops there once.
+        let f = self.plan.chunk.clone();
+        let n_pre = if f.emits.is_some() { prompt } else { prompt - 1 };
+        let mark =
+            (!self.every_page).then_some(q.request.history_tokens).flatten().filter(|&m| m > start && m <= n_pre);
+        let first = match mark {
+            Some(m) => {
+                let first = self.prefill(&f, &row, &ids[..m], start)?;
+                self.keep_prompt(&mut row, &ids[..m], id)?;
+                match m < n_pre {
+                    true => self.prefill(&f, &row, &ids[..n_pre], m)?,
+                    false => first,
+                }
             }
-            None => (start, None, q.request.prompt_tokens[start + 1..].iter().copied().collect()),
+            None => self.prefill(&f, &row, &ids[..n_pre], start)?,
         };
+        self.stats.prefill_ns += t0.elapsed().as_nanos();
+        self.stats.prefill_tokens += (n_pre - start) as u64;
         self.stats.prefix_hit_tokens += start as u64;
         if woken {
             self.stats.host_hits += 1;
@@ -659,7 +640,6 @@ impl KernScheduler {
             id,
             pos: n_pre,
             next: q.request.prompt_tokens[n_pre.min(prompt - 1)],
-            pending,
             generated: 0,
             emitted: 0,
             max_tokens,
@@ -843,25 +823,12 @@ impl KernScheduler {
                 c.num_draft_tokens += rows - 1;
                 c.num_accepted_tokens += accepted as u64;
             }
-            // A row still feeding its prompt: this step's output is
-            // dropped, the next prompt token is the next input.
-            let done = match s.pending.pop_front() {
-                Some(t) => {
-                    self.stats.prefill_tokens += 1;
-                    s.advance([s.next]);
-                    s.next = t;
-                    false
-                }
-                None => {
-                    // The tokens taken are in the state now: what was fed
-                    // and every accepted one after it.
-                    let taken = toks.len().max(1);
-                    s.advance(std::iter::once(s.next).chain(toks[..taken - 1].iter().copied()));
-                    let (n, done) = s.emit(&toks, ledger);
-                    self.stats.tokens += n;
-                    done
-                }
-            };
+            // The tokens taken are in the state now: what was fed and
+            // every accepted one after it.
+            let taken = toks.len().max(1);
+            s.advance(std::iter::once(s.next).chain(toks[..taken - 1].iter().copied()));
+            let (n, done) = s.emit(&toks, ledger);
+            self.stats.tokens += n;
             if done {
                 self.finish(s);
             } else {
@@ -1021,25 +988,13 @@ mod tests {
     #[test]
     fn plain_plan() {
         let p = check(&plain(), 16, None, 4).unwrap();
-        assert_eq!(
-            (p.rows, p.step.name.as_str(), p.chunk.as_ref().map(|f| f.name.as_str())),
-            (1, "decode", Some("prefill"))
-        );
-        assert_eq!((p.headroom(), p.counters().is_none(), p.chunk.as_ref().unwrap().emits), (0, true, None));
+        assert_eq!((p.rows, p.step.name.as_str(), p.chunk.name.as_str()), (1, "decode", "prefill"));
+        assert_eq!((p.headroom(), p.counters().is_none(), p.chunk.emits), (0, true, None));
         // The operator's ask, within the sequences bound.
         assert_eq!(
             (check(&plain(), 16, None, 0).unwrap().max_seqs, check(&plain(), 16, None, 100).unwrap().max_seqs),
             (1, 4)
         );
-    }
-
-    #[test]
-    fn a_prompt_goes_through_steps_without_a_chunk_forward() {
-        let mut m = plain();
-        m.programs.remove("prefill");
-        m.ops.remove("write");
-        let p = check(&m, 16, None, 4).unwrap();
-        assert_eq!((p.chunk, p.rows), (None, 1));
     }
 
     #[test]
@@ -1058,10 +1013,10 @@ mod tests {
     fn plan_rejections() {
         rejects(&plain(), 16, Some(4), "no program takes one sequence of 4 rows; the manifest declares rows [1]");
         rejects(&speculative(), 2, Some(4), "exceed the 2-token pad page");
-        let mut m = speculative();
+        let mut m = plain();
         m.programs.remove("prefill");
         m.ops.remove("write");
-        rejects(&m, 16, Some(4), "prompts go through steps, which takes one-row steps, not 4");
+        rejects(&m, 16, None, "nothing to feed a prompt through");
         // Only a chunk forward, one that hands a token back: nothing to step with.
         let mut m = plain();
         let head = m.programs["decode"].calls[0].clone();

@@ -101,7 +101,7 @@ target/release/kern-serve --manifest examples/qwen3.8-27b-dflash2.json --kernels
 `batch: {groups, rows}`（dspark 7 行、dflash2 8 行）。scheduler 装权重前
 先算 `Plan`：`--rows`（缺省 manifest 声明的最宽）选出 `step` forward，
 `rows − 1 ≤ MAX_SPEC_TOKENS`（前端计数器）、rows ≤ 页（pad 页要装下一组）、
-rows > 1 时必须有 chunk program（prompt 逐 token 走 step 的模型只能 1 行），
+必须有 chunk program（prompt 只走它），
 `max_seqs` 按 `tokens.max / rows` 与 `groups` 上界收紧。之后 plain decode
 与投机轮是同一段 `step()`：
 
@@ -330,9 +330,9 @@ page_table 是 256 × 8192 i32 = 8 MiB，每步每卡整块 DMA。改成只拷�
   `blocks` fill，collective 核按它换算行号（peer_collective.cu）；own 轴的 buffer 仍按最大块的
   bucket b 铺、pad 页每卡一页。`Staged` 借住 `&mut Tray` 直到输出读完，中间不能 lease / fork /
   再 stage。manifest 有 `error` fill 的输出时每步读一次，非零即该步失败。
-- **没有 prefill program 时 prompt 逐 token 走 step**：`prefill` 可选；没有时 prompt 在 prefix
-  命中之后一步一个 token 地喂，输出丢弃，直到最后一个 prompt token。b>1 走形状包含
-  `(b, 1)` 的 program 里 `groups` 上界最紧的那个；没有 chunk program 时 `--rows` 只能是 1。
+- **prompt 只走 chunk program**：manifest 必须有一个接受"1 组、行数随喂"的 program，没有就拒绝
+  启动（2026-10-12 之前没有它的 decode-only manifest 逐 token 走 step，或走 span，K3 迁出后删了）。
+  b>1 走形状包含 `(b, rows)` 的 program 里 `groups` 上界最紧的那个。
 - 权重不分 rank 文件：每个 rank 打开同一份 checkpoint（目录 = 全部分片），manifest 的
   bind 按 rank 选行 / 列 / 张量（manifest.md"权重"）。
   `--capacity` / `--host-gib` / `--max-seqs` 都是 per rank。
