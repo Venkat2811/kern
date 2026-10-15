@@ -909,9 +909,10 @@ impl PpHead {
                 self.note(Note::Retire(r.id))?;
                 continue;
             }
-            let why = if r.stop.classify(tok, |_| false).is_some() { FinishReason::Stop } else { FinishReason::Length };
+            let cause = r.stop.classify(tok, |_| false);
+            let why = if cause.is_some() { FinishReason::Stop } else { FinishReason::Length };
             self.note(Note::Emit { id: r.id, tok })?;
-            self.note(Note::Finish { id: r.id, why, cause: None })?;
+            self.note(Note::Finish { id: r.id, why, cause })?;
         }
         Ok(())
     }
