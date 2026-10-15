@@ -3,7 +3,9 @@
 //! the pinned host blocks and timing events the streams work with.
 
 use std::os::raw::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use crate::local_ipc;
 
 use cudarc::driver::{sys, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceSlice, SyncOnDrop};
 
@@ -25,6 +27,11 @@ pub enum PeerHandle {
         fabric: [u8; 64],
         bytes: u64,
     },
+    /// Opt-in same-host broker locator; the FD travels via SCM_RIGHTS.
+    Posix {
+        wire: [u8; 64],
+        bytes: u64,
+    },
     /// Meaningful in the exporting process only.
     Local {
         handle: sys::CUmemGenericAllocationHandle,
@@ -37,15 +44,19 @@ impl PeerHandle {
 
     pub(crate) fn bytes(&self) -> u64 {
         match self {
-            Self::Fabric { bytes, .. } | Self::Local { bytes, .. } => *bytes,
+            Self::Fabric { bytes, .. } | Self::Posix { bytes, .. } | Self::Local { bytes, .. } => *bytes,
         }
     }
 
-    /// Wire form of a fabric handle, what a caller carries to another
-    /// process: 64 bytes of handle, then the mapped size, little-endian.
+    /// Wire form: 64 bytes of Fabric handle or tagged local broker locator,
+    /// then the mapped size, little-endian. Fabric bytes stay unchanged.
     /// `None` for a local handle, which no other process can map.
     pub fn to_bytes(&self) -> Option<[u8; Self::BYTES]> {
-        let Self::Fabric { fabric, bytes } = self else { return None };
+        let (fabric, bytes) = match self {
+            Self::Fabric { fabric, bytes } => (fabric, bytes),
+            Self::Posix { wire, bytes } => (wire, bytes),
+            Self::Local { .. } => return None,
+        };
         let mut out = [0u8; Self::BYTES];
         out[..64].copy_from_slice(fabric);
         out[64..].copy_from_slice(&bytes.to_le_bytes());
@@ -56,7 +67,13 @@ impl PeerHandle {
         if b.len() != Self::BYTES {
             return None;
         }
-        Some(Self::Fabric { fabric: b[..64].try_into().ok()?, bytes: u64::from_le_bytes(b[64..].try_into().ok()?) })
+        let wire = b[..64].try_into().ok()?;
+        let bytes = u64::from_le_bytes(b[64..].try_into().ok()?);
+        if &b[..16] == local_ipc::MAGIC {
+            Some(Self::Posix { wire, bytes })
+        } else {
+            Some(Self::Fabric { fabric: wire, bytes })
+        }
     }
 }
 
@@ -67,6 +84,11 @@ impl std::fmt::Debug for PeerHandle {
                 f,
                 "PeerHandle::Fabric({bytes} bytes, {:02x}{:02x}{:02x}{:02x}…)",
                 fabric[0], fabric[1], fabric[2], fabric[3]
+            ),
+            Self::Posix { wire, bytes } => write!(
+                f,
+                "PeerHandle::Posix({bytes} bytes, pid {})",
+                u32::from_le_bytes(wire[48..52].try_into().unwrap())
             ),
             Self::Local { handle, bytes } => write!(f, "PeerHandle::Local({bytes} bytes, handle {handle:#x})"),
         }
@@ -108,6 +130,8 @@ struct Vmm {
     size: usize,
     /// Created with a fabric handle, so it exports as one.
     fabric: bool,
+    posix: bool,
+    exports: Mutex<Vec<local_ipc::Export>>,
     owns_handle: bool,
 }
 
@@ -241,8 +265,18 @@ fn map_handle(
 /// can map it: with a fabric handle when the device offers one, through
 /// the allocation handle itself otherwise (see [`PeerHandle`]).
 pub(crate) fn alloc_vmm(stream: &Arc<CudaStream>, dev: i32, bytes: u64, what: &str) -> Result<DeviceBuf> {
-    let fabric = fabric_supported(dev)?;
-    let prop = alloc_prop(dev, if fabric { fabric_handle_type() } else { none_handle_type() });
+    let posix = local_ipc::enabled();
+    let fabric = !posix && fabric_supported(dev)?;
+    let prop = alloc_prop(
+        dev,
+        if posix {
+            sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        } else if fabric {
+            fabric_handle_type()
+        } else {
+            none_handle_type()
+        },
+    );
     let g = granularity(&prop)?;
     let size = (bytes.max(1) as usize).div_ceil(g) * g;
     let mut handle: sys::CUmemGenericAllocationHandle = 0;
@@ -266,7 +300,7 @@ pub(crate) fn alloc_vmm(stream: &Arc<CudaStream>, dev: i32, bytes: u64, what: &s
             return Err(e);
         }
     };
-    let vmm = Vmm { handle, va, size, fabric, owns_handle: true };
+    let vmm = Vmm { handle, va, size, fabric, posix, exports: Mutex::new(Vec::new()), owns_handle: true };
     cuda_check(unsafe { sys::cuMemsetD8Async(va, 0, size, stream.cu_stream()) }, "cuMemsetD8Async")?;
     Ok(DeviceBuf { ptr: va, bytes, span: bytes, stream: stream.clone(), backing: Backing::Vmm(vmm) })
 }
@@ -292,6 +326,7 @@ pub(crate) fn import(stream: &Arc<CudaStream>, dev: i32, h: &PeerHandle, what: &
             )?;
             (handle, true)
         }
+        PeerHandle::Posix { wire, .. } => (local_ipc::import(wire)?, true),
         PeerHandle::Local { handle, .. } => (*handle, false),
     };
     let release = |handle| {
@@ -314,7 +349,7 @@ pub(crate) fn import(stream: &Arc<CudaStream>, dev: i32, h: &PeerHandle, what: &
         }
     };
     tracing::debug!("{what}: {} GiB imported in {imported:?}, mapped in {:?}", size >> 30, t0.elapsed() - imported);
-    let vmm = Vmm { handle, va, size, fabric: false, owns_handle };
+    let vmm = Vmm { handle, va, size, fabric: false, posix: false, exports: Mutex::new(Vec::new()), owns_handle };
     Ok(DeviceBuf { ptr: va, bytes: h.bytes(), span: h.bytes(), stream: stream.clone(), backing: Backing::Vmm(vmm) })
 }
 
@@ -349,6 +384,13 @@ impl DeviceBuf {
     pub(crate) fn export(&self) -> Result<Option<PeerHandle>> {
         let Backing::Vmm(v) = &self.backing else { return Ok(None) };
         let bytes = v.size as u64;
+        if v.posix {
+            let mut exports = v.exports.lock().unwrap();
+            if exports.is_empty() {
+                exports.push(local_ipc::export(v.handle)?);
+            }
+            return Ok(Some(PeerHandle::Posix { wire: exports[0].wire, bytes }));
+        }
         if !v.fabric {
             return Ok(Some(PeerHandle::Local { handle: v.handle, bytes }));
         }
@@ -647,26 +689,45 @@ pub(crate) struct Physical {
     handles: Vec<sys::CUmemGenericAllocationHandle>,
     chunk: usize,
     fabric: bool,
+    posix: bool,
+    exports: Mutex<Vec<local_ipc::Export>>,
     owns: bool,
 }
 
 impl Physical {
     pub(crate) fn create(dev: i32, chunk: usize, count: usize) -> Result<Physical> {
-        let fabric = fabric_supported(dev)?;
-        match Physical::create_as(dev, chunk, count, fabric) {
+        let posix = local_ipc::enabled();
+        let fabric = !posix && fabric_supported(dev)?;
+        match Physical::create_as(dev, chunk, count, fabric, posix) {
             // The attribute says fabric, the driver says no (no IMEX
             // channel, say): only this process's runtimes can mirror them.
             Err(e) if fabric => {
                 tracing::warn!("state chunks: cuMemCreate with a fabric handle failed ({e}); creating without one");
-                Physical::create_as(dev, chunk, count, false)
+                Physical::create_as(dev, chunk, count, false, false)
             }
             r => r,
         }
     }
 
-    fn create_as(dev: i32, chunk: usize, count: usize, fabric: bool) -> Result<Physical> {
-        let prop = alloc_prop(dev, if fabric { fabric_handle_type() } else { none_handle_type() });
-        let mut out = Physical { handles: Vec::with_capacity(count), chunk, fabric, owns: true };
+    fn create_as(dev: i32, chunk: usize, count: usize, fabric: bool, posix: bool) -> Result<Physical> {
+        let prop = alloc_prop(
+            dev,
+            if posix {
+                sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            } else if fabric {
+                fabric_handle_type()
+            } else {
+                none_handle_type()
+            },
+        );
+        let mut out = Physical {
+            handles: Vec::with_capacity(count),
+            chunk,
+            fabric,
+            posix,
+            exports: Mutex::new(Vec::new()),
+            owns: true,
+        };
         for i in 0..count {
             let mut h: sys::CUmemGenericAllocationHandle = 0;
             if let Err(e) = cuda_check(unsafe { sys::cuMemCreate(&mut h, chunk, &prop, 0) }, "cuMemCreate") {
@@ -680,6 +741,14 @@ impl Physical {
     /// What a peer maps to reach each chunk, in chunk order.
     pub(crate) fn export(&self) -> Result<Vec<PeerHandle>> {
         let bytes = self.chunk as u64;
+        if self.posix {
+            let mut exports = self.exports.lock().unwrap();
+            while exports.len() < self.handles.len() {
+                let next = local_ipc::export(self.handles[exports.len()])?;
+                exports.push(next);
+            }
+            return Ok(exports.iter().map(|e| PeerHandle::Posix { wire: e.wire, bytes }).collect());
+        }
         self.handles
             .iter()
             .map(|&handle| {
@@ -705,14 +774,23 @@ impl Physical {
 
     /// A peer's chunks, each `chunk` bytes, all of one kind of handle.
     pub(crate) fn import(chunk: usize, handles: &[PeerHandle], what: &str) -> Result<Physical> {
-        let owns = matches!(handles.first(), Some(PeerHandle::Fabric { .. }));
-        let mut out = Physical { handles: Vec::with_capacity(handles.len()), chunk, fabric: false, owns };
+        let owns = matches!(handles.first(), Some(PeerHandle::Fabric { .. } | PeerHandle::Posix { .. }));
+        let mut out = Physical {
+            handles: Vec::with_capacity(handles.len()),
+            chunk,
+            fabric: false,
+            posix: false,
+            exports: Mutex::new(Vec::new()),
+            owns,
+        };
         for (i, h) in handles.iter().enumerate() {
             if h.bytes() != chunk as u64 {
                 bail!(Api, "{what}: chunk {i} is {} bytes, the pool's chunks are {chunk}", h.bytes());
             }
             let handle = match (h, owns) {
-                (PeerHandle::Fabric { fabric, .. }, true) => {
+                (PeerHandle::Fabric { fabric, .. }, true)
+                    if matches!(handles.first(), Some(PeerHandle::Fabric { .. })) =>
+                {
                     let mut fh = sys::CUmemFabricHandle { data: *fabric };
                     let mut handle: sys::CUmemGenericAllocationHandle = 0;
                     cuda_check(
@@ -726,6 +804,9 @@ impl Physical {
                         &format!("{what}: chunk {i}: cuMemImportFromShareableHandle"),
                     )?;
                     handle
+                }
+                (PeerHandle::Posix { wire, .. }, true) if matches!(handles.first(), Some(PeerHandle::Posix { .. })) => {
+                    local_ipc::import(wire)?
                 }
                 (PeerHandle::Local { handle, .. }, false) => *handle,
                 _ => bail!(Api, "{what}: chunk {i} is {h:?}, chunk 0 is a different kind of handle"),
