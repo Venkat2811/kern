@@ -240,7 +240,7 @@ Output: byte-identical.
 
 ```bash
 curl -fsSL https://kern-baa.pages.dev/install.sh | sh   # Linux x86_64 / aarch64, one binary
-kern --version                                          # kern 0.2.3 (<commit>, cuda 13.0)
+kern --version                                          # kern 0.3.0 (<commit>, cuda 13.0)
 ```
 
 The [quick start](https://kern-baa.pages.dev/docs/getting-started/) runs
