@@ -19,6 +19,10 @@
 
 ## What agents have done with it
 
+This personal fork's B300 reproduction branch is documented in
+[Kimi-K3 on HGX B300](docs/b300-reproduction.md), including the tested base,
+local IPC and EOS fixes, validation, and remaining cross-node limitations.
+
 - [**One night, 17% more requests than vLLM.**](docs/vllm-rsi-example.md) Agents optimized Qwen3.8-27B on live Claude Code traffic, three rounds, no human in between.
 - [**The same engine in SGLang, 10.5% more requests.**](docs/sglang.md) The overnight manifest, rewritten for SGLang's memory layout.
 - [**A new model family in one session.**](docs/qwen38-bringup.md) Qwen3.8-27B plus its speculative draft in under 2.5 hours, one human intervention.
