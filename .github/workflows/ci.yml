@@ -103,7 +103,7 @@ jobs:
     # Workspace-wide visibility lint. Only `unnecessary_restricted_visibility`
     # is enforced: a `pub(crate)` cannot cross a crate boundary, so that class
     # is exact. `dead_public` and `unnecessary_public` stay an audit tool until
-    # the public surface is trimmed; see the `hawk` skill. Hawk is built
+    # the public surface is trimmed; see Gates in AGENTS.md. Hawk is built
     # against one exact rustc; bump both together. Hawk compiles the whole
     # workspace, kern-serve included, so the job needs the serving stack's
     # build dependencies and keeps its target directory between runs.

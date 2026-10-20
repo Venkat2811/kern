@@ -244,7 +244,7 @@ lease` panic，这个好抓。改成 `.min(max_seqs.max(k))` 之后一切"正常
 7 行后，96 token 的散文在第 19 个 token 处分叉；先用 `kern run --probe-dir` dump plain 在
 该位的 logits：top-1/top-2 差 0.125（bf16 一个 ulp）。cuBLAS 按 m 选核，m=8 与 m=7 各翻
 一边，旧路径与 plain 的"逐字同"本来就是运气。规则：**分叉先读 margin 再定性**
-（CLAUDE.md 门禁那句），margin ≤ 几个 ulp 就记进 docs 当核噪声，不追。
+（AGENTS.md 门禁那句），margin ≤ 几个 ulp 就记进 docs 当核噪声，不追。
 
 **压测 prompt 的散文要够长、够多样，报接受率要看窗口。** 512 token 的中文 docs 段落有
 几条掉进重复循环（"用 `--show-raw` 显示原始数据。"×N），那条的接受率 71%；wall-clock 的
@@ -315,7 +315,7 @@ stream 上的拷贝，结果每次 6 GB 唤醒卡 decode 30 ms，8 路 decode �
 checkpoint 直到落地才还页、wake 只给 `Waking`、`awake` 落地了才交 `Lease`：没有
 `Lease` 就没有程序能读到路上的页，不用任何 stream 等待。规则：**异步资源的"可用"
 用类型表达，不用事件等待表达**——一个句柄能被拿到，就意味着它背后的检查已经做完
-（CLAUDE.md 里"a type exists because something was checked"的又一个实例）。
+（AGENTS.md 里"a type exists because something was checked"的又一个实例）。
 
 **pinned 内存要落在卡所在的 NUMA 节点。** 同一个 6 GB 唤醒在 GPU 0 上 31 ms、在
 GPU 2 上 52 ms，一度以为是卡的差异；用 `numactl --membind` 一试，GPU 2 也是 31 ms。

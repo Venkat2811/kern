@@ -293,7 +293,7 @@ round 两个 program。
   的调用"，不是"缺 `prefill`"。
 - CI：`crates/kern-serve` 和 `crates/kern-run` 里 grep 不到
   `"token_ids"` / `"prefill"` / `"decode_batch"` 等任何 fill 或 program
-  名字面量。这条是机器能查的，进 CI 不进 CLAUDE.md。
+  名字面量。这条是机器能查的，进 CI 不进 AGENTS.md。
 
 ## 9. 落地记录（2026-09-03，tray03）
 
@@ -345,7 +345,7 @@ round 两个 program。
   logit 差 0.125，verify 的 GEMM 从 m=8 变 m=7 翻了个近平局；`--rows 1`
   与 plain 逐字同，"The capital of France is" 32 token 与 plain 逐字同
   （3.56 tok/step、44% 接受、1087 tok/s；v3 分相 3.44 / 38% / 948）。
-  按 CLAUDE.md 的门禁判为核噪声。
+  按 AGENTS.md 的门禁判为核噪声。
 - 接受率不塌：serve.md 投机一节的表（conc32 34% / 24%）。
 - `kern verify examples/k3-ep4.json` 报的是协议事实，不是"缺 prefill"。
 - CI：kern-run / kern-serve 非测试代码 grep 不到任何 fill / program /

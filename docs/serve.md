@@ -355,7 +355,7 @@ K3 在 tray 上的 span 实测（93 层 EP4 / EP4×TP4 的 E3 场景、每个 tp
 量的是 decode 步里夹 prompt 行的 run；run 与 K3 的生成器、manifest 在 2026-10-12 一起迁出（K3 现在在
 [kern-k3-pp-prefill](https://github.com/pegainfer-project/kern-k3-pp-prefill)，走 chunk program），表格见 git 历史。
 
-**没测**（按 CLAUDE.md 的门禁排队）：
+**没测**（按 AGENTS.md 的门禁排队）：
 1. ~~t=1 qwen3.8-27b（有 slot 的路径）conc1 与 `kern run` 同，K1/K3 门禁数字不变~~（e2e 门禁一节，2026-09-14）；
 2. owner-only 页在 t>1 下：mixed 行、prefix 命中（retire → lease_from）、park / wake 之后 warm == cold；
 3. 全成或全不成：某一卡 `--host-gib` 故意给小，park 整体退回、四卡 host 占用回到原值。
